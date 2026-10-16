@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- [Product] is still a placeholder in the spec (§11). Change it here. -->
+    <string name="app_name">Asset Trail</string>
+    <string name="product_name">Asset Trail</string>
+</resources>

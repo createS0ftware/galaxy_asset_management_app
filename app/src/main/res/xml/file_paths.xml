@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Load photos taken at pickup. Only their SHA-256 goes into the waypoint payload. -->
+    <files-path name="load_photos" path="load-photos/" />
+</paths>
