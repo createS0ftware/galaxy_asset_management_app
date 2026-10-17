@@ -24,4 +24,5 @@ rootProject.name = "asset-trail"
 
 include(":core")
 include(":platform-mock")
+include(":platform-http")
 include(":app")

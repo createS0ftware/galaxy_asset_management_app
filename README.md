@@ -25,7 +25,13 @@ Needs JDK 17 or newer and the Android SDK with platform 37. Gradle 9.8.1 comes w
 ```
 
 ```bash
-./gradlew :core:test :platform-mock:test
+./gradlew :core:test :platform-mock:test :platform-http:test
+```
+
+The `debug` build is the demo below. The `live` build talks to the backend at `http://10.0.2.2:3000` (the development machine from the emulator; change `API_BASE_URL` in `app/build.gradle.kts`). Sign in with a phone number ops registered; until an SMS provider is wired in, the backend logs the code.
+
+```bash
+./gradlew :app:installLive
 ```
 
 ## Demo walkthrough
@@ -49,7 +55,7 @@ Simulated until the HTTP client is in: the signer service, fee account, ledger, 
 
 ## Not done yet
 
-- An HTTP `PlatformApi` client for the backend (driver JWT, error mapping, composing the snapshot), and push instead of polling.
+- Push instead of polling, and live position pings to the backend.
 - QR tags, cryptographic NFC tags (NTAG 424 DNA), Play Integrity attestation.
 - Uploading load photos to the payload store.
 - Release signing and R8 rules (release builds aren't minified).

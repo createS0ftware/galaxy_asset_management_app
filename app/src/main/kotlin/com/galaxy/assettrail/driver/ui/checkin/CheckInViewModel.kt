@@ -8,6 +8,7 @@ import com.galaxy.assettrail.core.model.TripPlan
 import com.galaxy.assettrail.core.model.Waypoint
 import com.galaxy.assettrail.core.model.WaypointType
 import com.galaxy.assettrail.driver.AppContainer
+import com.galaxy.assettrail.driver.BuildConfig
 import com.galaxy.assettrail.driver.ui.ActionViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,6 +38,7 @@ class CheckInViewModel(private val container: AppContainer, private val waypoint
     val waypoint: Waypoint? = plan?.waypoints?.getOrNull(waypointIndex)
     val online: StateFlow<Boolean> = container.online
     val isDemo = container.isDemo
+    val demoTools = container.demoTools
     val nfcAvailable: Boolean get() = container.nfc.isAvailable
     val nfcEnabled: Boolean get() = container.nfc.isEnabled
 
@@ -48,7 +50,9 @@ class CheckInViewModel(private val container: AppContainer, private val waypoint
     private fun onTagScanned(tag: String) {
         if (_ui.value.step != Step.SCAN) return
         container.nfc.setListening(false)
-        val matches = tag.equals(plan?.asset?.tagId, ignoreCase = true)
+        // A platform that keeps the tag id to itself checks the scan when the check-in arrives.
+        val expected = plan?.asset?.tagId
+        val matches = expected.isNullOrBlank() || tag.equals(expected, ignoreCase = true)
         _ui.value = _ui.value.copy(tag = tag)
         if (matches && waypoint?.type == WaypointType.PICKUP) {
             _ui.value = _ui.value.copy(step = Step.PHOTO)
@@ -59,7 +63,8 @@ class CheckInViewModel(private val container: AppContainer, private val waypoint
 
     /** Demo: act as the right tag, or as a tag from some other asset. */
     fun demoScan(correct: Boolean) {
-        val tag = if (correct) plan?.asset?.tagId ?: return else "04:A3:7E:00"
+        // A live platform keeps the tag id to itself; debug builds know the walkthrough asset's tag.
+        val tag = if (correct) plan?.asset?.tagId?.takeIf { it.isNotBlank() } ?: BuildConfig.DEMO_TAG_ID else "04:A3:7E:00"
         container.nfc.simulateScan(tag)
     }
 

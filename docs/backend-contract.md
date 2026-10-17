@@ -1,6 +1,9 @@
 # How the driver app talks to the backend
 
-The backend is [galaxy_asset_management_backend](../../galaxy_asset_management_backend): a Soroban contract (`asset-trail`) plus a Fastify API. The app reaches it through one Kotlin interface, `PlatformApi` ([core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt)). Until an HTTP client exists, the `:platform-mock` module answers in-process and behaves like the backend for the phone. Swap the implementation in [AppContainer.kt](../app/src/main/kotlin/com/galaxy/assettrail/driver/AppContainer.kt).
+The backend is [galaxy_asset_management_backend](../../galaxy_asset_management_backend): a Soroban contract (`asset-trail`) plus a Fastify API. The app reaches it through one Kotlin interface, `PlatformApi` ([core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt)), with two implementations picked in [AppContainer.kt](../app/src/main/kotlin/com/galaxy/assettrail/driver/AppContainer.kt):
+
+- `live` builds: `HttpPlatformApi` in `:platform-http`, against `BuildConfig.API_BASE_URL` (`http://10.0.2.2:3000`, the development machine from the emulator). The driver JWT from the OTP sign-in is kept encrypted with a Keystore key.
+- `debug` (demo) builds: `:platform-mock`, in-process, behaving like the backend for the phone.
 
 ## The model
 
@@ -29,7 +32,7 @@ All routes are under `/v1`. Amounts are USDC with 7 decimals (decimal strings on
 | `submitKyc` | none | Sample data |
 | `network` | `GET /network` | Passphrase, contract id, pay asset |
 | `prepareWallet`, `submitWallet` | `POST /driver/wallet/prepare {publicKey}`, `POST /driver/wallet/submit {xdr}` | Sign and submit within 60 s |
-| `snapshot` | `GET /driver/me`, `/driver/wallet`, `/driver/trips`, `/driver/trips/:id` | No single snapshot route yet; the client composes it |
+| `snapshot` | `GET /driver/trips`, `/driver/wallet`, `/network` (and `/driver/me` once) | No single snapshot route; the client composes it. Offers are `funded` trips; the final leg's state comes from the trip status and its closing custody event |
 | `acceptOffer` | `POST /driver/trips/:id/accept` | No decline route (not implemented) |
 | `submitCheckIns` | `POST /driver/trips/:id/checkins/batch {items: [{payload, authEntry}]}` | In order, up to 64, stops at the first failure; re-sends are idempotent |
 | `reportTagMismatch` | none | Sample data; the backend alerts ops when it refuses with `TAG_MISMATCH` |
@@ -56,10 +59,11 @@ Other calls raise `PlatformException(code, message)` with the backend's code, fo
 ## Where the demo differs from the backend
 
 - Time windows aren't checked and a check-in outside the geofence is accepted, so the demo runs anywhere in minutes. The trip screen warns when the driver is outside the geofence; the backend refuses with `OUTSIDE_WINDOW` / `OUTSIDE_GEOFENCE`.
-- Sign-up, KYC and the MoMo number are sample data. On the backend, ops registers the driver and their MoMo number.
+- Sign-up, KYC and the MoMo number are sample data. On the backend, ops registers the driver and their MoMo number; `submitKyc` is answered by the client itself.
+- The mock shares the asset's tag id, so the phone blocks a wrong scan before signing. The backend keeps tag ids to itself, so on live builds the signer service refuses a wrong tag (`TAG_MISMATCH`) when the check-in arrives.
 - Trips can't be declined.
 
 ## Still to do
 
-- HTTP `PlatformApi` client (session token, error mapping, composing the snapshot).
-- Push instead of polling; photo upload to the payload store.
+- Push instead of polling: each poll is three requests, and `/driver/wallet` and `/network` each ask Stellar RPC.
+- Live position pings (`POST /driver/trips/:id/location`) and photo upload to the payload store.

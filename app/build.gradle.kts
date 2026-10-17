@@ -4,6 +4,16 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+// The backend for live builds. The default is the development machine as seen from the emulator;
+// for a phone on USB, `adb reverse tcp:3000 tcp:3000` and build with -PapiBaseUrl=http://127.0.0.1:3000.
+val apiBaseUrl: String = providers.gradleProperty("apiBaseUrl").getOrElse("http://10.0.2.2:3000")
+
+// Debuggable live builds prefill sign-in with this driver (registered by ops for a walkthrough).
+val demoDriverPhone: String = providers.gradleProperty("demoDriverPhone").getOrElse("+233 20 000 0077")
+
+// ...and simulate scanning this asset tag (the backend keeps tag ids to itself).
+val demoTagId: String = providers.gradleProperty("demoTagId").getOrElse("04:A3:7E:91")
+
 android {
     namespace = "com.galaxy.assettrail.driver"
     compileSdk = 37
@@ -17,9 +27,19 @@ android {
 
         // Demo build: in-process fake platform (signer service, ledger, anchor) and demo controls.
         buildConfigField("boolean", "DEMO", "true")
+        buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
+        buildConfigField("String", "DEMO_DRIVER_PHONE", "\"$demoDriverPhone\"")
+        buildConfigField("String", "DEMO_TAG_ID", "\"$demoTagId\"")
     }
 
     buildTypes {
+        // Debug with the real backend: ./gradlew :app:installLive
+        create("live") {
+            initWith(getByName("debug"))
+            buildConfigField("boolean", "DEMO", "false")
+            applicationIdSuffix = ".live"
+            matchingFallbacks += listOf("debug")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -51,8 +71,9 @@ android {
 
 dependencies {
     implementation(project(":core"))
-    // Until the backend team's API is wired in: in-process stand-in for it.
+    // Demo builds: in-process stand-in for the backend. Live builds: the HTTP client.
     implementation(project(":platform-mock"))
+    implementation(project(":platform-http"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)

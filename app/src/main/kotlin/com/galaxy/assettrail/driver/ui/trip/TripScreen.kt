@@ -1,13 +1,18 @@
 package com.galaxy.assettrail.driver.ui.trip
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -16,6 +21,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -82,30 +88,64 @@ fun TripScreen(
     val online by viewModel.online.collectAsStateWithLifecycle()
     val fix by viewModel.fix.collectAsStateWithLifecycle()
     val busy by viewModel.busy.collectAsStateWithLifecycle()
+    val progress by viewModel.progress.collectAsStateWithLifecycle()
     val now = rememberNow()
     var showDemo by remember { mutableStateOf(false) }
     MessageEffect(viewModel)
 
     val trip = state.trip
-    when {
-        trip == null -> NoTrip(state, online, viewModel.isDemo, onOpenOffer, onShowDemo = { showDemo = true })
-        trip.closed -> TripComplete(trip, onDone = viewModel::finishTrip, onOpenWallet = onOpenWallet)
-        else -> ActiveTripContent(
-            state = state,
-            trip = trip,
-            online = online,
-            fix = fix,
-            now = now,
-            busy = busy,
-            viewModel = viewModel,
-            onCheckIn = onCheckIn,
-            onOpenCheckIn = onOpenCheckIn,
-            onRequestAdvance = onRequestAdvance,
-            onOpenWallet = onOpenWallet,
-            onShowDemo = { showDemo = true },
-        )
+    Box(Modifier.fillMaxSize()) {
+        when {
+            trip == null -> NoTrip(state, online, viewModel.demoTools, onOpenOffer, onShowDemo = { showDemo = true })
+            trip.closed -> TripComplete(trip, onDone = viewModel::finishTrip, onOpenWallet = onOpenWallet)
+            else -> ActiveTripContent(
+                state = state,
+                trip = trip,
+                online = online,
+                fix = fix,
+                now = now,
+                busy = busy,
+                viewModel = viewModel,
+                onCheckIn = onCheckIn,
+                onOpenCheckIn = onOpenCheckIn,
+                onRequestAdvance = onRequestAdvance,
+                onOpenWallet = onOpenWallet,
+                onShowDemo = { showDemo = true },
+            )
+        }
+        // Demo autopilot: a tap anywhere on the trip moves the journey on one step.
+        if (viewModel.demoTools) {
+            Box(Modifier.matchParentSize().pointerInput(Unit) { detectTapGestures { viewModel.autopilot() } })
+        }
+        progress?.let { WorkingOverlay(it, Modifier.matchParentSize()) }
     }
     if (showDemo) DemoControlsSheet(onDismiss = { showDemo = false })
+}
+
+/** While a step records on the ledger: a check-in returns once its transaction is in a closed ledger. */
+@Composable
+private fun WorkingOverlay(text: String, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .background(Palette.Ink.copy(alpha = 0.78f))
+            .pointerInput(Unit) { detectTapGestures { } },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier.padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            CircularProgressIndicator(color = Palette.Ledger)
+            Text(text, style = Type.BodyStrong, color = Palette.Text, textAlign = TextAlign.Center)
+            Text(
+                "Waiting for the Stellar testnet ledger to close, usually 5–10 seconds.",
+                style = Type.Small,
+                color = Palette.TextSecondary,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
 }
 
 @Composable
@@ -183,7 +223,7 @@ private fun ActiveTripContent(
 
         if (next != null) {
             NextStop(trip, next, fix, now, viewModel, onCheckIn)
-            if (viewModel.isDemo) {
+            if (viewModel.demoTools) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     val inside = fix != null && Geo.distanceM(fix.point, next.position) <= next.geofenceRadiusM
                     if (inside) {
@@ -197,7 +237,7 @@ private fun ActiveTripContent(
             }
         } else {
             DeliveryStatus(trip, now, busy, viewModel)
-            if (viewModel.isDemo) DemoChip("Receiver and ops controls", onClick = onShowDemo)
+            if (viewModel.demoTools) DemoChip("Receiver and ops controls", onClick = onShowDemo)
         }
 
         AdvanceNotice(trip, onOpenWallet)

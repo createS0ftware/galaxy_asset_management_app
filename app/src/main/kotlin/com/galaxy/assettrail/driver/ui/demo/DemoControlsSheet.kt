@@ -40,6 +40,8 @@ import kotlinx.coroutines.launch
 class DemoViewModel(private val container: AppContainer) : ActionViewModel() {
     private val repository = container.repository
     private val demo = container.demo
+    /** The in-app demo platform can also play ops and the payout partner; a live backend can't. */
+    val inAppPlatform = container.isDemo
     val state: StateFlow<DriverState> = repository.state
     val noSignal: MutableStateFlow<Boolean> = container.simulatedNoSignal
 
@@ -136,23 +138,28 @@ fun DemoControlsSheet(onDismiss: () -> Unit) {
                 enabled = arrived && contract == ContractStatus.LOCKED,
                 busy = busy,
             )
-            SecondaryButton(
-                "Receiver reports a problem",
-                onClick = viewModel::receiverReportsProblem,
-                enabled = arrived && contract == ContractStatus.LOCKED,
-            )
+            if (viewModel.inAppPlatform) {
+                SecondaryButton(
+                    "Receiver reports a problem",
+                    onClick = viewModel::receiverReportsProblem,
+                    enabled = arrived && contract == ContractStatus.LOCKED,
+                )
+            }
             if (!arrived) Text("Available once the driver checks in at the delivery stop.", style = Type.Caption, color = Palette.TextSecondary)
 
-            Section("Ops and the contract")
-            SecondaryButton("Resolve dispute for the driver", onClick = viewModel::resolveForDriver, enabled = contract == ContractStatus.DISPUTED)
-            SecondaryButton("Skip past the delivery deadline", onClick = viewModel::expireDeadline, enabled = arrived && contract == ContractStatus.LOCKED)
-            SwitchRow("Decline the next advance", flags.declineNextAdvance) { on -> viewModel.setFlags { it.copy(declineNextAdvance = on) } }
+            // Live builds talk to the real backend: only the receiver's side can be played from here.
+            if (viewModel.inAppPlatform) {
+                Section("Ops and the contract")
+                SecondaryButton("Resolve dispute for the driver", onClick = viewModel::resolveForDriver, enabled = contract == ContractStatus.DISPUTED)
+                SecondaryButton("Skip past the delivery deadline", onClick = viewModel::expireDeadline, enabled = arrived && contract == ContractStatus.LOCKED)
+                SwitchRow("Decline the next advance", flags.declineNextAdvance) { on -> viewModel.setFlags { it.copy(declineNextAdvance = on) } }
 
-            Section("Platform")
-            SwitchRow("Fee account low on XLM", flags.feeAccountLow) { on -> viewModel.setFlags { it.copy(feeAccountLow = on) } }
+                Section("Platform")
+                SwitchRow("Fee account low on XLM", flags.feeAccountLow) { on -> viewModel.setFlags { it.copy(feeAccountLow = on) } }
 
-            Section("Payout partner")
-            SwitchRow("Fail the next cash out", flags.failNextCashOut) { on -> viewModel.setFlags { it.copy(failNextCashOut = on) } }
+                Section("Payout partner")
+                SwitchRow("Fail the next cash out", flags.failNextCashOut) { on -> viewModel.setFlags { it.copy(failNextCashOut = on) } }
+            }
         }
     }
 }

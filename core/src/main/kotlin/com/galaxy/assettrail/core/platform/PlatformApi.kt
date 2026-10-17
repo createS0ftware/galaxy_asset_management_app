@@ -151,8 +151,11 @@ enum class RejectCode {
 }
 
 sealed interface CheckInResult {
-    /** On the ledger. [duplicate]: it already was, from an earlier upload of the same payload. */
-    data class Recorded(val txHash: String, val ledgerTime: Long, val balance: Usdc, val duplicate: Boolean = false) : CheckInResult
+    /**
+     * On the ledger. [duplicate]: it already was, from an earlier upload of the same payload.
+     * [balance] is the wallet balance after it, when the platform reports one.
+     */
+    data class Recorded(val txHash: String, val ledgerTime: Long, val balance: Usdc?, val duplicate: Boolean = false) : CheckInResult
 
     /** Refused for good; nothing was recorded. */
     data class Rejected(val code: RejectCode, val message: String) : CheckInResult

@@ -332,7 +332,8 @@ class DriverRepository(
             return CheckInOutcome.Blocked(BlockReason.MOCK_LOCATION, "Turn off mock locations in your phone's settings to check in.")
         }
         val tag = request.scannedTag.trim().uppercase()
-        if (tag != plan.asset.tagId.uppercase()) {
+        // A platform that keeps the tag id to itself (the backend does) checks the scan when the check-in arrives.
+        if (plan.asset.tagId.isNotBlank() && tag != plan.asset.tagId.uppercase()) {
             if (online.value) {
                 runCatching { platform.reportTagMismatch(requireProfile().driverId, plan.id, waypoint.index, tag) }
             }
@@ -557,8 +558,8 @@ class DriverRepository(
         copy(
             queue = queue.filterNot { it.id == item.id },
             queueNotice = null,
-            balance = result.balance,
-            balanceAsOf = result.ledgerTime,
+            balance = result.balance ?: balance,
+            balanceAsOf = if (result.balance != null) result.ledgerTime else balanceAsOf,
         ).updateCheckIn(item) {
             it.copy(
                 status = CheckInStatus.RECORDED,

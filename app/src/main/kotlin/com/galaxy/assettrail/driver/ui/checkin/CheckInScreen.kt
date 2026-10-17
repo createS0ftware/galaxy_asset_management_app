@@ -138,7 +138,7 @@ private fun ScanStep(viewModel: CheckInViewModel, assetName: String, assetId: St
         style = Type.Small,
         color = Palette.TextSecondary,
     )
-    if (viewModel.isDemo) {
+    if (viewModel.demoTools) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             DemoChip("Scan the right tag", onClick = { viewModel.demoScan(correct = true) })
             DemoChip("Scan a wrong tag", onClick = { viewModel.demoScan(correct = false) })
@@ -213,7 +213,7 @@ private fun PhotoStep(viewModel: CheckInViewModel, ui: CheckInViewModel.Ui, asse
                 cameraError = true
             }
         })
-        if (viewModel.isDemo) DemoChip("Use a sample photo", onClick = viewModel::useSamplePhoto)
+        if (viewModel.demoTools) DemoChip("Use a sample photo", onClick = viewModel::useSamplePhoto)
     } else {
         PrimaryButton("Start the trip", icon = AppIcons.Pin, onClick = viewModel::confirmPhoto)
         SecondaryButton("Retake photo", onClick = viewModel::clearPhoto, minHeight = 52.dp)

@@ -16,6 +16,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,6 +35,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.galaxy.assettrail.core.driver.Onboarding
 import com.galaxy.assettrail.core.driver.OnboardingStep
 import com.galaxy.assettrail.driver.AppContainer
+import com.galaxy.assettrail.driver.BuildConfig
 import com.galaxy.assettrail.driver.ui.ActionViewModel
 import com.galaxy.assettrail.driver.ui.Banner
 import com.galaxy.assettrail.driver.ui.BannerTone
@@ -119,9 +121,20 @@ private fun StepIndicator(step: Int) {
 
 @Composable
 private fun PhoneStep(viewModel: OnboardingViewModel, onboarding: Onboarding, busy: Boolean) {
-    var phone by rememberSaveable { mutableStateOf(if (viewModel.isDemo) "+233 24 123 4471" else "+233 ") }
+    var phone by rememberSaveable {
+        mutableStateOf(
+            when {
+                viewModel.isDemo -> "+233 24 123 4471"
+                // Debuggable live builds: the test driver ops registered for the walkthrough.
+                BuildConfig.DEBUG -> BuildConfig.DEMO_DRIVER_PHONE
+                else -> "+233 "
+            },
+        )
+    }
     var code by rememberSaveable { mutableStateOf("") }
     val codeSent = onboarding.phone != null
+    // A demo platform hands the code back instead of texting it: fill it in.
+    LaunchedEffect(onboarding.demoCode) { onboarding.demoCode?.let { code = it } }
 
     ScreenTitle("Get paid for every leg")
     Text(
@@ -160,8 +173,9 @@ private fun PhoneStep(viewModel: OnboardingViewModel, onboarding: Onboarding, bu
 
 @Composable
 private fun IdentityStep(viewModel: OnboardingViewModel, busy: Boolean) {
-    var name by rememberSaveable { mutableStateOf(if (viewModel.isDemo) "Kwame Asante" else "") }
-    var idNumber by rememberSaveable { mutableStateOf(if (viewModel.isDemo) "GHA-723451890-3" else "") }
+    val sample = viewModel.isDemo || BuildConfig.DEBUG
+    var name by rememberSaveable { mutableStateOf(if (sample) "Kwame Asante" else "") }
+    var idNumber by rememberSaveable { mutableStateOf(if (sample) "GHA-723451890-3" else "") }
 
     ScreenTitle("Check your ID")
     Text(
