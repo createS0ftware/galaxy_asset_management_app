@@ -2,31 +2,32 @@ package com.galaxy.assettrail.core.driver
 
 import com.galaxy.assettrail.core.geo.Geo
 import com.galaxy.assettrail.core.geo.GpsFix
+import com.galaxy.assettrail.core.ledger.AuthEntries
 import com.galaxy.assettrail.core.ledger.DriverTransactions
-import com.galaxy.assettrail.core.ledger.LedgerConfig
+import com.galaxy.assettrail.core.ledger.LedgerClock
+import com.galaxy.assettrail.core.ledger.NetworkInfo
+import com.galaxy.assettrail.core.ledger.TrailCalls
 import com.galaxy.assettrail.core.model.AdvanceInfo
 import com.galaxy.assettrail.core.model.AdvanceStatus
 import com.galaxy.assettrail.core.model.CashOutInfo
-import com.galaxy.assettrail.core.model.CashOutStatus
 import com.galaxy.assettrail.core.model.ContractInfo
 import com.galaxy.assettrail.core.model.ContractStatus
 import com.galaxy.assettrail.core.model.FirmQuote
-import com.galaxy.assettrail.core.model.OverrideInfo
 import com.galaxy.assettrail.core.model.Usdc
 import com.galaxy.assettrail.core.model.WaypointType
+import com.galaxy.assettrail.core.payload.FinalPayClaim
 import com.galaxy.assettrail.core.payload.Hashes
 import com.galaxy.assettrail.core.payload.WaypointEvent
 import com.galaxy.assettrail.core.payload.WaypointPayload
+import com.galaxy.assettrail.core.platform.CheckInResult
 import com.galaxy.assettrail.core.platform.DriverSnapshot
 import com.galaxy.assettrail.core.platform.KycSubmission
 import com.galaxy.assettrail.core.platform.OfflineException
-import com.galaxy.assettrail.core.platform.OverrideRequest
 import com.galaxy.assettrail.core.platform.PlatformApi
 import com.galaxy.assettrail.core.platform.PlatformException
-import com.galaxy.assettrail.core.platform.RejectCode
-import com.galaxy.assettrail.core.platform.Submission
-import com.galaxy.assettrail.core.platform.SubmitResult
-import com.galaxy.assettrail.core.platform.TxKind
+import com.galaxy.assettrail.core.platform.PreparedTransaction
+import com.galaxy.assettrail.core.platform.SignedCheckIn
+import com.galaxy.assettrail.core.platform.SignedClaim
 import com.galaxy.assettrail.core.platform.WalletRequest
 import com.galaxy.assettrail.core.store.StateStore
 import kotlinx.coroutines.CoroutineScope
@@ -65,26 +66,31 @@ sealed interface CheckInOutcome {
     data class Blocked(val reason: BlockReason, val message: String) : CheckInOutcome
 }
 
-enum class BlockReason { NO_TRIP, NOT_NEXT, TAG_MISMATCH, OUTSIDE_GEOFENCE, MOCK_LOCATION }
+enum class BlockReason { NO_TRIP, NOT_NEXT, TAG_MISMATCH, MOCK_LOCATION, NOT_SET_UP }
 
 /**
- * The driver app's single source of truth. Talks to the platform only through [PlatformApi]
- * (built by the backend team), signs driver transactions with [DriverKeyStore], and keeps every
- * driver-sourced transaction in one ordered queue that survives restarts and lost signal (BR-09).
+ * The driver app's single source of truth. Talks to the platform only through [PlatformApi],
+ * signs with [DriverKeyStore], and keeps check-ins signed on the phone in one ordered queue that
+ * survives restarts and lost signal (BR-09).
+ *
+ * Check-ins and claims are Soroban authorization entries: the fee account is the transaction
+ * source, so nothing here tracks a sequence number. The two classic transactions the driver signs
+ * (wallet set-up and cash-out) are built by the platform and checked here before signing.
  */
 class DriverRepository(
     private val platform: PlatformApi,
     private val store: StateStore<DriverState>,
     private val keys: DriverKeyStore,
-    private val ledger: LedgerConfig,
     private val online: StateFlow<Boolean>,
     private val clock: Clock,
     private val scope: CoroutineScope,
     private val pollIntervalMillis: Long = 4_000,
 ) {
-    private val transactions = DriverTransactions(ledger)
     private val stateLock = Mutex()
     private val flushLock = Mutex()
+
+    /** The contract can be redeployed between app starts, so the network info is re-read once per process. */
+    private var networkChecked = false
 
     private val _state = MutableStateFlow(DriverState())
     val state: StateFlow<DriverState> = _state.asStateFlow()
@@ -137,6 +143,24 @@ class DriverRepository(
         if (!online.value) throw OfflineException()
     }
 
+    /** The network info, from the platform when the phone doesn't have it yet. */
+    private suspend fun network(): NetworkInfo {
+        state.value.network?.let { return it }
+        val info = platform.network()
+        update { it.copy(network = info) }
+        networkChecked = true
+        return info
+    }
+
+    /** For a call made online: valid for [ONLINE_AUTH_LEDGERS] ledgers from the network's latest. */
+    private suspend fun onlineValidUntil(network: NetworkInfo): Long {
+        val ledger = state.value.ledger ?: run {
+            refresh()
+            state.value.ledger
+        } ?: throw IllegalStateException("Still syncing with the network. Try again in a moment.")
+        return ledger.estimate(now(), network.ledgerSeconds) + ONLINE_AUTH_LEDGERS
+    }
+
     // region Onboarding: phone, ID check with the anchor, MoMo + wallet (T2)
 
     suspend fun sendCode(phone: String) {
@@ -169,16 +193,24 @@ class DriverRepository(
         }
     }
 
+    /**
+     * T2: the key is made here, on the phone, and only its public address goes to the platform. The
+     * platform prepares the sponsored account + trustline; the phone checks it and signs.
+     */
     suspend fun finishOnboarding(momoNumber: String, recovery: Boolean) {
         val onboarding = state.value.onboarding
         val driverId = onboarding.driverId ?: throw IllegalStateException("Verify your phone first.")
         val fullName = onboarding.fullName ?: throw IllegalStateException("Check your ID first.")
-        // The key is made here, on the phone. Only its public address goes to the platform.
+        val network = network()
         val accountId = keys.accountId() ?: keys.create()
-        val wallet = platform.createWallet(
+        val prepared = platform.prepareWallet(
             driverId,
             WalletRequest(accountId, fullName, onboarding.phone.orEmpty(), momoNumber.trim(), recovery),
         )
+        val transaction = checkedTransaction(prepared, network) { tx ->
+            DriverTransactions.walletProblem(tx, accountId, network.stellarAsset)
+        }
+        val wallet = platform.submitWallet(driverId, DriverTransactions.sign(transaction, keys.signer()))
         update {
             it.copy(
                 profile = DriverProfile(
@@ -191,7 +223,6 @@ class DriverRepository(
                     kycProvider = onboarding.kycProvider.orEmpty(),
                     walletTx = wallet.txHash,
                 ),
-                sequence = wallet.sequence,
                 onboarding = Onboarding(),
             )
         }
@@ -202,42 +233,49 @@ class DriverRepository(
         update { s -> s.copy(profile = s.profile?.copy(momoNumber = momoNumber.filter { it.isDigit() || it == '+' })) }
     }
 
+    /**
+     * A signature can't be taken back: refuse anything that isn't for this network or that does
+     * more than the platform said it would.
+     */
+    private fun checkedTransaction(prepared: PreparedTransaction, network: NetworkInfo, problem: (Transaction) -> String?): Transaction {
+        if (prepared.networkPassphrase != network.networkPassphrase) {
+            throw PlatformException(TX_REFUSED, "The platform prepared a transaction for another network, so it wasn't signed.")
+        }
+        val transaction = runCatching { DriverTransactions.parse(prepared.xdr, network.network) }
+            .getOrElse { throw PlatformException(TX_REFUSED, "The platform's transaction couldn't be read, so it wasn't signed.") }
+        problem(transaction)?.let { throw PlatformException(TX_REFUSED, "Not signed: $it.") }
+        return transaction
+    }
+
     // endregion
 
     // region Sync
 
-    /** Pulls balance, offers, contract and advance status. Returns false when offline. */
+    /** Pulls balance, offers, contract and advance status, and the latest ledger. Returns false when offline. */
     suspend fun refresh(): Boolean {
         val profile = state.value.profile ?: return false
         if (!online.value) return false
         val snapshot = try {
+            if (!networkChecked) {
+                val info = platform.network()
+                update { it.copy(network = info) }
+                networkChecked = true
+            }
             platform.snapshot(profile.driverId, state.value.trip?.plan?.id)
         } catch (_: OfflineException) {
             return false
         } catch (_: PlatformException) {
             return false
         }
-        update { it.merge(snapshot) }
+        val seenAt = now()
+        update { it.merge(snapshot, seenAt) }
         return true
     }
 
-    private fun DriverState.merge(snapshot: DriverSnapshot): DriverState {
+    private fun DriverState.merge(snapshot: DriverSnapshot, seenAt: Long): DriverState {
         val mergedTrip = trip?.let { current ->
             val status = snapshot.trip?.takeIf { it.tripId == current.plan.id } ?: return@let current
-            val latePaid = status.latePayments.map { it.waypointIndex }.toSet()
-            current.copy(
-                contract = status.contract,
-                advances = mergeAdvances(current.advances, status.advances),
-                overrides = status.overrides,
-                closed = status.closed,
-                checkIns = current.checkIns.map { checkIn ->
-                    if (checkIn.pay == LegPayStatus.PENDING_ESCROW && checkIn.waypointIndex in latePaid) {
-                        checkIn.copy(pay = LegPayStatus.PAID)
-                    } else {
-                        checkIn
-                    }
-                },
-            )
+            current.copy(contract = status.contract, advances = status.advances, closed = status.closed)
         }
         return copy(
             offers = snapshot.offers,
@@ -245,29 +283,10 @@ class DriverRepository(
             balance = snapshot.balance,
             balanceAsOf = snapshot.serverTime,
             activity = snapshot.activity,
-            cashOuts = mergeCashOuts(cashOuts, snapshot.cashOuts),
-            // With nothing queued the ledger is the truth; otherwise keep the numbers already used.
-            sequence = if (queue.isEmpty()) snapshot.sequence else maxOf(sequence, snapshot.sequence),
+            cashOuts = snapshot.cashOuts,
+            ledger = LedgerClock(snapshot.latestLedger, seenAt),
             lastSyncAt = snapshot.serverTime,
         )
-    }
-
-    /** A claim waiting in the queue stays "claimed" locally even if the platform hasn't seen it yet. */
-    private fun DriverState.mergeAdvances(local: List<AdvanceInfo>, remote: List<AdvanceInfo>): List<AdvanceInfo> {
-        val queuedClaims = queue.mapNotNull { (it.spec as? TxSpec.ClaimAdvanceTx)?.advanceId }.toSet()
-        return remote.map { advance ->
-            if (advance.id in queuedClaims && advance.status == AdvanceStatus.READY) {
-                local.firstOrNull { it.id == advance.id } ?: advance
-            } else {
-                advance
-            }
-        }
-    }
-
-    private fun DriverState.mergeCashOuts(local: List<CashOutInfo>, remote: List<CashOutInfo>): List<CashOutInfo> {
-        val remoteIds = remote.map { it.id }.toSet()
-        // Keep local cash-outs the platform doesn't list yet (still in the queue).
-        return (remote + local.filter { it.id !in remoteIds }).sortedByDescending { it.createdAt }
     }
 
     // endregion
@@ -291,21 +310,15 @@ class DriverRepository(
         refresh()
     }
 
-    suspend fun declineOffer(tripId: String) {
-        val profile = requireProfile()
-        platform.declineOffer(profile.driverId, tripId)
-        update { it.copy(offers = it.offers.filterNot { offer -> offer.id == tripId }) }
-        refresh()
-    }
-
     /** After the completion screen: forget the closed trip. */
     suspend fun finishTrip() {
         update { if (it.trip?.closed == true) it.copy(trip = null) else it }
     }
 
     /**
-     * Builds the salted payload, hashes it, signs the check-in transaction on the phone and queues
-     * it. Online, it is submitted straight away; offline, it records on reconnect, in order.
+     * Builds the salted payload, hashes it, signs the `check_in` authorization on the phone and
+     * queues it. Online, it is submitted straight away; offline, it records on reconnect, in order.
+     * Outside the geofence the check-in still goes ahead; the trip screen warns first.
      */
     suspend fun checkIn(request: CheckInRequest): CheckInOutcome {
         val trip = state.value.trip ?: return CheckInOutcome.Blocked(BlockReason.NO_TRIP, "You don't have an active trip.")
@@ -328,24 +341,17 @@ class DriverRepository(
                 "This tag ($tag) isn't the ${plan.asset.shortName.lowercase()} on this trip. Check-in is blocked and ops has been alerted.",
             )
         }
-        val distance = Geo.distanceRoundedM(request.fix.point, waypoint.position)
-        val override = trip.approvedOverrideFor(waypoint.index)
-        if (distance > waypoint.geofenceRadiusM && override == null) {
-            return CheckInOutcome.Blocked(
-                BlockReason.OUTSIDE_GEOFENCE,
-                "You're ${formatDistance(distance)} from ${waypoint.name}. Check-in unlocks inside the ${waypoint.geofenceRadiusM} m geofence.",
-            )
+        val network = state.value.network
+        val ledger = state.value.ledger
+        if (network == null || ledger == null) {
+            return CheckInOutcome.Blocked(BlockReason.NOT_SET_UP, "Connect to the internet once so this phone can sign check-ins.")
         }
 
         val now = now()
         val payload = WaypointPayload(
             trip = plan.id,
             waypoint = waypoint.index,
-            event = when (waypoint.type) {
-                WaypointType.PICKUP -> WaypointEvent.PICKUP
-                WaypointType.CHECKPOINT -> WaypointEvent.CHECKIN
-                WaypointType.DELIVERY -> WaypointEvent.DELIVERY
-            },
+            event = WaypointEvent.at(waypoint.index, plan.delivery.index),
             asset = plan.asset.id,
             tag = tag,
             lat = WaypointPayload.roundCoordinate(request.fix.point.lat),
@@ -354,19 +360,25 @@ class DriverRepository(
             deviceTime = WaypointPayload.truncateTime(now),
             photos = request.photoHashes,
             salt = WaypointPayload.newSalt(),
-            override = override?.id,
         )
         val canonical = payload.canonical()
-        val hash = Hashes.hex(Hashes.sha256(canonical))
+        val hash = Hashes.sha256(canonical)
+        val validUntil = ledger.offlineValidUntil(now, network)
+        val authEntry = AuthEntries.authorize(
+            keys.signer(),
+            TrailCalls.checkIn(network.contractId, plan.id, waypoint.index, hash),
+            validUntil,
+            network.network,
+        )
         val legPay = waypoint.legPay.takeIf { waypoint.isPaidAtCheckIn }
         val checkIn = CheckIn(
             waypointIndex = waypoint.index,
             event = payload.event,
             payloadJson = canonical,
-            payloadHash = hash,
+            payloadHash = Hashes.hex(hash),
             deviceTime = now,
             tag = tag,
-            distanceFromCentreM = distance,
+            distanceFromCentreM = Geo.distanceRoundedM(request.fix.point, waypoint.position),
             savedOffline = !online.value,
             status = CheckInStatus.QUEUED,
             pay = when {
@@ -375,23 +387,18 @@ class DriverRepository(
                 else -> LegPayStatus.NONE
             },
             legPay = waypoint.legPay,
-            overrideId = override?.id,
         )
-        val spec = TxSpec.CheckInTx(
+        val queued = QueuedCheckIn(
+            id = UUID.randomUUID().toString(),
             tripId = plan.id,
             waypointIndex = waypoint.index,
             payloadJson = canonical,
-            payloadHash = hash,
-            assetAccount = plan.asset.account,
-            tripAccount = plan.tripAccount,
-            legPay = legPay,
-            maxTimeEpochSeconds = (now + ledger.offlineMaxAgeMillis) / 1000,
+            payloadHash = checkIn.payloadHash,
+            authEntry = authEntry,
+            validUntilLedger = validUntil,
+            createdAt = now,
         )
-        update { state ->
-            state.enqueue(TxKind.CHECK_IN, spec, now).let { queued ->
-                queued.copy(trip = queued.trip?.copy(checkIns = queued.trip.checkIns + checkIn))
-            }
-        }
+        update { s -> s.copy(queue = s.queue + queued, trip = s.trip?.copy(checkIns = s.trip.checkIns + checkIn)) }
 
         flush()
 
@@ -403,24 +410,27 @@ class DriverRepository(
         }
     }
 
-    /** "Request override": the geofence blocks check-in; ops sees the GPS evidence and decides. */
-    suspend fun requestOverride(fix: GpsFix, reason: String): OverrideInfo {
-        requireOnline()
-        val trip = requireTrip()
-        val waypoint = trip.nextWaypoint() ?: throw IllegalStateException("Every stop on this trip is checked in.")
-        val info = platform.requestOverride(
-            requireProfile().driverId,
-            OverrideRequest(trip.plan.id, waypoint.index, fix, reason),
-        )
-        update { s -> s.copy(trip = s.trip?.copy(overrides = s.trip.overrides.filterNot { it.id == info.id } + info)) }
-        return info
-    }
-
-    /** After the deadline, with no approval or dispute, the contract releases the final leg. */
+    /**
+     * After the deadline, with no signature or dispute, the driver releases the final leg with
+     * `claim_final_pay`. Only the driver's authorization is needed.
+     */
     suspend fun claimFinalPay() {
         requireOnline()
         val trip = requireTrip()
-        val contract = platform.claimFinalPay(requireProfile().driverId, trip.plan.id)
+        val network = network()
+        val claim = FinalPayClaim(
+            trip = trip.plan.id,
+            asset = trip.plan.asset.id,
+            deviceTime = WaypointPayload.truncateTime(now()),
+            salt = WaypointPayload.newSalt(),
+        )
+        val authEntry = AuthEntries.authorize(
+            keys.signer(),
+            TrailCalls.claimFinalPay(network.contractId, trip.plan.id, claim.hash()),
+            onlineValidUntil(network),
+            network.network,
+        )
+        val contract = platform.claimFinalPay(requireProfile().driverId, trip.plan.id, SignedClaim(claim.canonical(), authEntry))
         update { s -> s.copy(trip = s.trip?.copy(contract = contract)) }
         refresh()
     }
@@ -439,20 +449,22 @@ class DriverRepository(
         return info
     }
 
+    /** T7: authorizes `claim_advance(trip)`; the contract pays the advance from escrow. */
     suspend fun claimAdvance(advanceId: String) {
         requireOnline()
-        check(state.value.canMoveMoney()) { "Your saved check-ins record first." }
         val trip = requireTrip()
         val advance = trip.advances.firstOrNull { it.id == advanceId && it.status == AdvanceStatus.READY }
             ?: throw IllegalStateException("This advance can't be claimed.")
-        val spec = TxSpec.ClaimAdvanceTx(
-            tripId = trip.plan.id,
-            advanceId = advance.id,
-            balanceId = advance.balanceId ?: throw IllegalStateException("This advance isn't ready yet."),
-            maxTimeEpochSeconds = now() / 1000 + MONEY_TX_TIMEOUT_SECONDS,
+        val network = network()
+        val authEntry = AuthEntries.authorize(
+            keys.signer(),
+            TrailCalls.claimAdvance(network.contractId, trip.plan.id),
+            onlineValidUntil(network),
+            network.network,
         )
-        update { it.enqueue(TxKind.CLAIM_ADVANCE, spec, now()) }
-        flush()
+        val claimed = platform.claimAdvance(requireProfile().driverId, trip.plan.id, advance.id, authEntry)
+        update { s -> s.copy(trip = s.trip?.copy(advances = s.trip.advances.map { if (it.id == claimed.id) claimed else it })) }
+        refresh()
     }
 
     suspend fun quote(amount: Usdc): FirmQuote {
@@ -460,205 +472,111 @@ class DriverRepository(
         return platform.quote(requireProfile().driverId, amount)
     }
 
-    /** Confirms a firm quote: the anchor returns where to pay, and the phone signs T9. */
+    /** Confirms a firm quote: the platform prepares the payment to the anchor, the phone checks and signs it (T9). */
     suspend fun cashOut(quote: FirmQuote): CashOutInfo {
         requireOnline()
         check(state.value.canMoveMoney()) { "Your saved check-ins record first." }
         val profile = requireProfile()
-        val instructions = platform.startCashOut(profile.driverId, quote.id, profile.momoNumber)
-        val now = now()
-        val local = CashOutInfo(
-            id = instructions.cashOutId,
-            sell = instructions.amount,
-            fee = quote.fee,
-            buyAmount = quote.buyAmount,
-            buyCurrency = quote.buyCurrency,
-            momoNumber = profile.momoNumber,
-            status = CashOutStatus.AWAITING_PAYMENT,
-            createdAt = now,
-            updatedAt = now,
-            anchorName = quote.anchorName,
-            eta = quote.eta,
-        )
-        val spec = TxSpec.CashOutTx(
-            cashOutId = instructions.cashOutId,
-            anchorAccount = instructions.anchorAccount,
-            amount = instructions.amount,
-            memoHash = instructions.memoHashHex,
-            maxTimeEpochSeconds = now / 1000 + MONEY_TX_TIMEOUT_SECONDS,
-        )
-        update { it.enqueue(TxKind.CASH_OUT, spec, now).copy(cashOuts = listOf(local) + it.cashOuts) }
-        flush()
-        return state.value.cashOuts.firstOrNull { it.id == local.id } ?: local
+        val network = network()
+        val prepared = platform.prepareCashOut(profile.driverId, quote.id)
+        val transaction = checkedTransaction(prepared, network) { tx ->
+            DriverTransactions.cashOutProblem(tx, profile.accountId, network.stellarAsset, quote.sell, quote.payTo, quote.memo)
+        }
+        val cashOut = platform.submitCashOut(profile.driverId, quote.id, DriverTransactions.sign(transaction, keys.signer()))
+        update { s -> s.copy(cashOuts = listOf(cashOut) + s.cashOuts.filterNot { it.id == cashOut.id }) }
+        refresh()
+        return state.value.cashOuts.firstOrNull { it.id == cashOut.id } ?: cashOut
     }
 
     // endregion
 
     // region The queue
 
-    private fun DriverState.enqueue(kind: TxKind, spec: TxSpec, now: Long): DriverState {
-        val sequence = sequence + 1
-        val envelope = build(spec, sequence).toEnvelopeXdrBase64()
-        return copy(
-            sequence = sequence,
-            queue = queue + QueuedTx(UUID.randomUUID().toString(), kind, sequence, envelope, spec, now),
-        )
-    }
-
-    private fun build(spec: TxSpec, sequence: Long): Transaction {
-        val signer = keys.signer()
-        return when (spec) {
-            is TxSpec.CheckInTx -> transactions.checkIn(
-                signer = signer,
-                sequence = sequence,
-                payloadHash = Hashes.fromHex(spec.payloadHash),
-                assetAccount = spec.assetAccount,
-                tripAccount = spec.tripAccount,
-                legPay = spec.legPay,
-                maxTimeEpochSeconds = spec.maxTimeEpochSeconds,
-            )
-            is TxSpec.ClaimAdvanceTx -> transactions.claimAdvance(signer, sequence, spec.balanceId, spec.maxTimeEpochSeconds)
-            is TxSpec.CashOutTx -> transactions.cashOut(
-                signer = signer,
-                sequence = sequence,
-                anchorAccount = spec.anchorAccount,
-                amount = spec.amount,
-                memoHash = Hashes.fromHex(spec.memoHash),
-                maxTimeEpochSeconds = spec.maxTimeEpochSeconds,
-            )
-        }
-    }
-
-    /** Re-signs every queued transaction with consecutive sequence numbers after [base]. */
-    private fun DriverState.resequenced(base: Long): DriverState {
-        val rebuilt = queue.mapIndexed { i, item ->
-            val sequence = base + 1 + i
-            if (item.sequence == sequence) item
-            else item.copy(sequence = sequence, envelopeXdr = build(item.spec, sequence).toEnvelopeXdrBase64())
-        }
-        return copy(queue = rebuilt, sequence = base + rebuilt.size)
-    }
-
     /**
-     * Submits queued transactions strictly in order (§4.4). Stops at the first one that has to
-     * wait, so nothing jumps the queue.
+     * Submits saved check-ins strictly in route order (§4.4), one batch per trip. The platform stops
+     * at the first one that doesn't record: a refused one leaves the queue (the next is judged on
+     * its own), a "not now" stops here and keeps everything queued.
      */
     suspend fun flush() {
         flushLock.withLock {
             val profile = state.value.profile ?: return
-            var resyncs = 0
             var recordedAny = false
             while (online.value) {
-                val item = state.value.queue.firstOrNull() ?: break
-                val result = try {
-                    platform.submit(profile.driverId, item.toSubmission())
+                val head = state.value.queue.firstOrNull() ?: break
+                val batch = renewExpired(state.value.queue.filter { it.tripId == head.tripId }.take(MAX_BATCH))
+                val results = try {
+                    platform.submitCheckIns(profile.driverId, head.tripId, batch.map { SignedCheckIn(it.payloadJson, it.authEntry) })
                 } catch (_: OfflineException) {
                     break
                 } catch (e: PlatformException) {
                     update { it.copy(queueNotice = e.message) }
                     break
                 }
-                when (result) {
-                    is SubmitResult.Recorded -> {
-                        update { it.recorded(item, result) }
-                        recordedAny = true
-                    }
-                    is SubmitResult.BadSequence -> {
-                        if (resyncs++ >= MAX_RESYNCS) break
-                        update { it.resequenced(result.accountSequence) }
-                    }
-                    is SubmitResult.Rejected -> {
-                        val spec = item.spec
-                        if (result.code == RejectCode.ESCROW_UNDERFUNDED && spec is TxSpec.CheckInTx && spec.legPay != null) {
-                            update { it.recordOnlyFallback(item, spec) }
-                        } else {
-                            update { it.rejected(item, result) }
+                var waiting = results.isEmpty()
+                results.zip(batch).forEach { (result, item) ->
+                    when (result) {
+                        is CheckInResult.Recorded -> {
+                            update { it.recorded(item, result) }
+                            recordedAny = true
+                        }
+                        is CheckInResult.Rejected -> update { it.rejected(item, result) }
+                        is CheckInResult.Retry -> {
+                            update { it.copy(queueNotice = result.message) }
+                            waiting = true
                         }
                     }
-                    is SubmitResult.Retry -> {
-                        update { it.copy(queueNotice = result.message) }
-                        break
-                    }
                 }
+                if (waiting) break
             }
             if (recordedAny) refresh()
         }
     }
 
-    private fun QueuedTx.toSubmission(): Submission = when (val spec = spec) {
-        is TxSpec.CheckInTx -> Submission(kind, envelopeXdr, tripId = spec.tripId, payloadJson = spec.payloadJson, refId = id)
-        is TxSpec.ClaimAdvanceTx -> Submission(kind, envelopeXdr, tripId = spec.tripId, refId = spec.advanceId)
-        is TxSpec.CashOutTx -> Submission(kind, envelopeXdr, refId = spec.cashOutId)
+    /**
+     * An authorization that ran out of ledgers while the phone was offline is signed again for the
+     * same payload. The payload keeps its device time, so the platform still judges how late it is.
+     */
+    private suspend fun renewExpired(batch: List<QueuedCheckIn>): List<QueuedCheckIn> {
+        val network = state.value.network ?: return batch
+        val ledger = state.value.ledger ?: return batch
+        val current = ledger.estimate(now(), network.ledgerSeconds)
+        if (batch.none { it.validUntilLedger <= current + RENEW_MARGIN_LEDGERS }) return batch
+        val signer = keys.signer()
+        val renewed = batch.map { item ->
+            if (item.validUntilLedger > current + RENEW_MARGIN_LEDGERS) return@map item
+            val validUntil = current + ONLINE_AUTH_LEDGERS
+            val invocation = TrailCalls.checkIn(network.contractId, item.tripId, item.waypointIndex, Hashes.fromHex(item.payloadHash))
+            item.copy(authEntry = AuthEntries.authorize(signer, invocation, validUntil, network.network), validUntilLedger = validUntil)
+        }
+        val byId = renewed.associateBy { it.id }
+        update { s -> s.copy(queue = s.queue.map { byId[it.id] ?: it }) }
+        return renewed
     }
 
-    private fun DriverState.recorded(item: QueuedTx, result: SubmitResult.Recorded): DriverState {
-        val base = copy(
+    private fun DriverState.recorded(item: QueuedCheckIn, result: CheckInResult.Recorded): DriverState =
+        copy(
             queue = queue.filterNot { it.id == item.id },
             queueNotice = null,
             balance = result.balance,
             balanceAsOf = result.ledgerTime,
-        )
-        return when (val spec = item.spec) {
-            is TxSpec.CheckInTx -> base.updateCheckIn(spec.waypointIndex) {
-                it.copy(
-                    status = CheckInStatus.RECORDED,
-                    txHash = result.txHash,
-                    ledgerTime = result.ledgerTime,
-                    pay = if (it.pay == LegPayStatus.AWAITING_RECORD) LegPayStatus.PAID else it.pay,
-                )
-            }
-            is TxSpec.ClaimAdvanceTx -> base.copy(
-                trip = base.trip?.copy(
-                    advances = base.trip.advances.map {
-                        if (it.id == spec.advanceId) {
-                            it.copy(status = AdvanceStatus.CLAIMED, claimTx = result.txHash, claimedAt = result.ledgerTime)
-                        } else {
-                            it
-                        }
-                    },
-                ),
-            )
-            is TxSpec.CashOutTx -> base.copy(
-                cashOuts = base.cashOuts.map {
-                    if (it.id == spec.cashOutId) {
-                        it.copy(status = CashOutStatus.PENDING, txHash = result.txHash, updatedAt = result.ledgerTime)
-                    } else {
-                        it
-                    }
-                },
+        ).updateCheckIn(item) {
+            it.copy(
+                status = CheckInStatus.RECORDED,
+                txHash = result.txHash,
+                ledgerTime = result.ledgerTime,
+                pay = if (it.pay == LegPayStatus.AWAITING_RECORD) LegPayStatus.PAID else it.pay,
             )
         }
-    }
 
-    /** Refused for good. It never used its sequence number, so everything behind it moves up one. */
-    private fun DriverState.rejected(item: QueuedTx, result: SubmitResult.Rejected): DriverState {
-        val remaining = copy(queue = queue.filterNot { it.id == item.id }).resequenced(item.sequence - 1)
-        return when (val spec = item.spec) {
-            is TxSpec.CheckInTx -> remaining.updateCheckIn(spec.waypointIndex) {
-                it.copy(status = CheckInStatus.FAILED, failure = result.code, failureMessage = result.message)
-            }
-            is TxSpec.ClaimAdvanceTx -> remaining.copy(queueNotice = result.message)
-            is TxSpec.CashOutTx -> remaining.copy(
-                queueNotice = result.message,
-                cashOuts = remaining.cashOuts.map { if (it.id == spec.cashOutId) it.copy(message = result.message) else it },
-            )
+    /** Refused for good. Nothing else in the queue depends on it: each authorization has its own nonce. */
+    private fun DriverState.rejected(item: QueuedCheckIn, result: CheckInResult.Rejected): DriverState =
+        copy(queue = queue.filterNot { it.id == item.id }).updateCheckIn(item) {
+            it.copy(status = CheckInStatus.FAILED, failure = result.code, failureMessage = result.message)
         }
-    }
 
-    /**
-     * §8: the escrow can't pay, and the whole transaction would fail, location included. Re-sign the
-     * same check-in without its payment so custody is still recorded, and mark the pay pending.
-     */
-    private fun DriverState.recordOnlyFallback(item: QueuedTx, spec: TxSpec.CheckInTx): DriverState {
-        val recordOnly = spec.copy(legPay = null)
-        val envelope = build(recordOnly, item.sequence).toEnvelopeXdrBase64()
-        return copy(queue = queue.map { if (it.id == item.id) it.copy(spec = recordOnly, envelopeXdr = envelope) else it })
-            .updateCheckIn(spec.waypointIndex) { it.copy(pay = LegPayStatus.PENDING_ESCROW) }
-    }
-
-    private fun DriverState.updateCheckIn(index: Int, change: (CheckIn) -> CheckIn): DriverState {
-        val trip = trip ?: return this
-        val position = trip.checkIns.indexOfLast { it.waypointIndex == index }
+    private fun DriverState.updateCheckIn(item: QueuedCheckIn, change: (CheckIn) -> CheckIn): DriverState {
+        val trip = trip?.takeIf { it.plan.id == item.tripId } ?: return this
+        val position = trip.checkIns.indexOfLast { it.payloadHash == item.payloadHash }
         if (position < 0) return this
         val updated = trip.checkIns.toMutableList().also { it[position] = change(it[position]) }
         return copy(trip = trip.copy(checkIns = updated))
@@ -672,12 +590,21 @@ class DriverRepository(
             keys.delete()
             store.clear()
             _state.value = DriverState()
+            networkChecked = false
         }
     }
 
     companion object {
-        private const val MAX_RESYNCS = 2
-        private const val MONEY_TX_TIMEOUT_SECONDS = 300L
+        /** About 8 minutes at 5 s a ledger, like the platform's own co-signatures. */
+        private const val ONLINE_AUTH_LEDGERS = 100L
+
+        /** Re-sign a queued authorization when it has fewer ledgers left than this. */
+        private const val RENEW_MARGIN_LEDGERS = 12L
+
+        /** The batch endpoint takes up to 64 check-ins. */
+        private const val MAX_BATCH = 64
+
+        private const val TX_REFUSED = "TX_REFUSED"
 
         fun formatDistance(metres: Int): String =
             if (metres < 1_000) "$metres m" else "%.1f km".format(metres / 1000.0).replace(".0 km", " km")

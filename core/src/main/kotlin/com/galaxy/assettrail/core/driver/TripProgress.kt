@@ -5,13 +5,11 @@ import com.galaxy.assettrail.core.geo.GeoPoint
 import com.galaxy.assettrail.core.model.AdvanceInfo
 import com.galaxy.assettrail.core.model.AdvanceStatus
 import com.galaxy.assettrail.core.model.ContractStatus
-import com.galaxy.assettrail.core.model.OverrideStatus
 import com.galaxy.assettrail.core.model.TripPlan
 import com.galaxy.assettrail.core.model.Usdc
 import com.galaxy.assettrail.core.model.Waypoint
 import com.galaxy.assettrail.core.model.WaypointType
 import com.galaxy.assettrail.core.model.sum
-import com.galaxy.assettrail.core.platform.TxKind
 
 enum class LegState {
     /** Recorded on the ledger: drawn solid. */
@@ -63,20 +61,14 @@ fun ActiveTrip.isAwaitingSignature(): Boolean = hasArrivedAtDelivery() && contra
 
 fun ActiveTrip.canClaimFinalPay(now: Long): Boolean = isAwaitingSignature() && now > contract.deadline
 
-fun ActiveTrip.approvedOverrideFor(index: Int) =
-    overrides.lastOrNull { it.waypointIndex == index && it.status == OverrideStatus.APPROVED }
-
-fun ActiveTrip.pendingOverrideFor(index: Int) =
-    overrides.lastOrNull { it.waypointIndex == index && it.status == OverrideStatus.PENDING }
-
 fun ActiveTrip.distanceTo(waypoint: Waypoint, position: GeoPoint): Int = Geo.distanceRoundedM(position, waypoint.position)
 
 /** Check-ins saved on the phone and not yet on the ledger. */
-fun DriverState.pendingCheckIns(): List<QueuedTx> = queue.filter { it.kind == TxKind.CHECK_IN }
+fun DriverState.pendingCheckIns(): List<QueuedCheckIn> = queue
 
 /**
- * §4.4 sequence rule: cash-out and claims share the driver's sequence number with check-ins, so
- * they wait until saved check-ins are recorded.
+ * Cash-out waits until saved check-ins are recorded: the platform refuses one while check-ins are
+ * pending (CHECKINS_PENDING), so the balance it pays from is settled.
  */
 fun DriverState.canMoveMoney(): Boolean = pendingCheckIns().isEmpty()
 

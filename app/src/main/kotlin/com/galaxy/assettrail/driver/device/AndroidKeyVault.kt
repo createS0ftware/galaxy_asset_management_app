@@ -11,7 +11,6 @@ import com.galaxy.assettrail.core.ledger.DriverSigner
 import com.galaxy.assettrail.core.payload.Hashes
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import org.stellar.sdk.AbstractTransaction
 import org.stellar.sdk.KeyPair
 import org.stellar.sdk.StrKey
 import java.io.File
@@ -56,10 +55,10 @@ class AndroidKeyVault(context: Context) : DriverKeyStore {
         return object : DriverSigner {
             override val accountId: String = sealed.accountId
 
-            override fun sign(transaction: AbstractTransaction) {
+            override fun sign(data: ByteArray): ByteArray {
                 val seed = decrypt(sealed)
                 try {
-                    transaction.sign(KeyPair.fromSecretSeed(seed))
+                    return KeyPair.fromSecretSeed(seed).sign(data)
                 } finally {
                     seed.fill(0)
                 }

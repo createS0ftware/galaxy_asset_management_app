@@ -42,7 +42,7 @@ internal object DemoScenario {
     private val kumasiWarehouse = GeoPoint(6.6885, -1.6244)
 
     val outbound = Template(
-        asset = Asset("GX400-0041", "Diesel generator 400 kVA", "Generator", "04:A3:7E:91", account = ""),
+        asset = Asset("GX400-0041", "Diesel generator 400 kVA", "Generator", "04:A3:7E:91"),
         stops = listOf(
             Stop("Tema Port", WaypointType.PICKUP, temaPort, 300, 0, 60, "0"),
             Stop("Nsawam", WaypointType.CHECKPOINT, nsawam, 200, 120, 180, "18.00"),
@@ -55,7 +55,7 @@ internal object DemoScenario {
     )
 
     val returnRun = Template(
-        asset = Asset("TX250-0107", "Transformer 250 kVA", "Transformer", "04:5B:22:C8", account = ""),
+        asset = Asset("TX250-0107", "Transformer 250 kVA", "Transformer", "04:5B:22:C8"),
         stops = listOf(
             Stop("Kumasi · Warehouse B", WaypointType.PICKUP, kumasiWarehouse, 150, 0, 60, "0"),
             Stop("Konongo", WaypointType.CHECKPOINT, konongo, 300, 75, 135, "16.00"),
@@ -69,15 +69,7 @@ internal object DemoScenario {
 
     fun templateFor(tripNumber: Int): Template = if (tripNumber % 2 == 1) outbound else returnRun
 
-    fun plan(
-        template: Template,
-        tripId: String,
-        now: Long,
-        assetAccount: String,
-        tripAccount: String,
-        escrowContract: String,
-        fundingTx: String,
-    ): TripPlan {
+    fun plan(template: Template, tripId: String, now: Long, fundingTx: String): TripPlan {
         val quarterHour = 15 * 60_000L
         val start = Math.floorDiv(now, quarterHour) * quarterHour
         val waypoints = template.stops.mapIndexed { index, stop ->
@@ -94,11 +86,9 @@ internal object DemoScenario {
         }
         return TripPlan(
             id = tripId,
-            asset = template.asset.copy(account = assetAccount),
+            asset = template.asset,
             waypoints = waypoints,
             advanceLimit = template.advanceLimit,
-            tripAccount = tripAccount,
-            escrowContract = escrowContract,
             receiverName = template.receiverName,
             deliveryDeadline = waypoints.last().windowEnd + 24 * 3_600_000L,
             fundingTx = fundingTx,
@@ -108,7 +98,7 @@ internal object DemoScenario {
         )
     }
 
-    /** The hash anchored in T3's memo: the route plan, canonicalised the same way as waypoint payloads. */
+    /** The plan hash `create_trip` anchors: the route plan, canonicalised the same way as waypoint payloads. */
     private fun routePlanHash(tripId: String, template: Template, waypoints: List<Waypoint>): String {
         val json = buildJsonObject {
             put("v", 1)

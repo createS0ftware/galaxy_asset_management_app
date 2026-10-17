@@ -8,9 +8,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -29,7 +27,6 @@ import com.galaxy.assettrail.core.driver.CheckInStatus
 import com.galaxy.assettrail.core.driver.DriverState
 import com.galaxy.assettrail.core.driver.LegPayStatus
 import com.galaxy.assettrail.core.driver.LegState
-import com.galaxy.assettrail.core.driver.approvedOverrideFor
 import com.galaxy.assettrail.core.driver.canClaimFinalPay
 import com.galaxy.assettrail.core.driver.checkInAt
 import com.galaxy.assettrail.core.driver.earned
@@ -37,7 +34,6 @@ import com.galaxy.assettrail.core.driver.latestFailureAt
 import com.galaxy.assettrail.core.driver.legRows
 import com.galaxy.assettrail.core.driver.nextWaypoint
 import com.galaxy.assettrail.core.driver.pendingCheckIns
-import com.galaxy.assettrail.core.driver.pendingOverrideFor
 import com.galaxy.assettrail.core.geo.Geo
 import com.galaxy.assettrail.core.geo.GpsFix
 import com.galaxy.assettrail.core.model.AdvanceStatus
@@ -186,7 +182,7 @@ private fun ActiveTripContent(
         QueueBanner(state, online)
 
         if (next != null) {
-            NextStop(trip, next, fix, now, busy, viewModel, onCheckIn)
+            NextStop(trip, next, fix, now, viewModel, onCheckIn)
             if (viewModel.isDemo) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     val inside = fix != null && Geo.distanceM(fix.point, next.position) <= next.geofenceRadiusM
@@ -239,17 +235,13 @@ private fun NextStop(
     next: Waypoint,
     fix: GpsFix?,
     now: Long,
-    busy: Boolean,
     viewModel: TripViewModel,
     onCheckIn: (Int) -> Unit,
 ) {
     val distance = fix?.let { Geo.distanceRoundedM(it.point, next.position) }
     val inside = distance != null && distance <= next.geofenceRadiusM
-    val approvedOverride = trip.approvedOverrideFor(next.index)
-    val pendingOverride = trip.pendingOverrideFor(next.index)
     val mock = fix?.isMock == true
-    val canCheckIn = fix != null && !mock && (inside || approvedOverride != null)
-    var confirmOverride by remember { mutableStateOf(false) }
+    val canCheckIn = fix != null && !mock
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Eyebrow(
@@ -308,10 +300,8 @@ private fun NextStop(
         val helper = when {
             mock -> "Mock locations are turned on. Turn them off to check in."
             fix == null -> "Waiting for your location."
-            !inside && approvedOverride != null ->
-                "Ops allowed check-in here, ${Formats.distance(approvedOverride.distanceM)} from the centre."
             inside -> "You're inside the ${next.geofenceRadiusM} m geofence. Works without signal."
-            else -> "Unlocks inside the ${next.geofenceRadiusM} m geofence. Works without signal."
+            else -> "Outside the ${next.geofenceRadiusM} m geofence. Works without signal."
         }
         Text(
             helper,
@@ -322,42 +312,16 @@ private fun NextStop(
         )
     }
 
-    if (fix != null && !inside && approvedOverride == null) {
-        if (pendingOverride != null) {
-            Banner(
-                title = "Asked ops to allow check-in here",
-                text = "They can see your GPS position (${Formats.distance(pendingOverride.distanceM)} from the centre). Waiting for their answer.",
-                tone = BannerTone.PENDING,
-            )
-        } else if (distance != null && distance < 5_000) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                TextAction("At the stop but can't check in? Ask ops", onClick = { confirmOverride = true }, enabled = !busy)
-            }
-        }
-    }
-
-    if (confirmOverride && distance != null) {
-        AlertDialog(
-            onDismissRequest = { confirmOverride = false },
-            containerColor = Palette.Surface,
-            title = { Text("Ask ops to allow check-in?", style = Type.Subheading, color = Palette.Text) },
-            text = {
-                Text(
-                    "Your GPS puts you ${Formats.distance(distance)} from ${next.name}, outside its ${next.geofenceRadiusM} m geofence. " +
-                        "Ops gets your position as evidence. If they allow it, the override is recorded with the check-in.",
-                    style = Type.Body,
-                    color = Palette.TextLabel,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmOverride = false
-                    viewModel.requestOverride()
-                }) { Text("Send to ops", color = Palette.Ember, style = Type.ButtonSecondary) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmOverride = false }) { Text("Cancel", color = Palette.TextLabel, style = Type.ButtonSecondary) }
-            },
+    if (distance != null && !inside && !mock) {
+        Banner(
+            title = "You're outside the geofence",
+            text = "Your GPS puts you ${Formats.distance(distance)} from ${next.name}, outside its ${next.geofenceRadiusM} m geofence. " +
+                if (viewModel.isDemo) {
+                    "In the demo the check-in still goes ahead; the live signer service refuses check-ins outside the geofence."
+                } else {
+                    "The signer service will refuse the check-in from here. Move closer to the stop first."
+                },
+            tone = BannerTone.PENDING,
         )
     }
 }
@@ -504,7 +468,7 @@ private fun LegList(trip: ActiveTrip, onOpenCheckIn: (Int) -> Unit) {
                         WaypointType.CHECKPOINT ->
                             if (checkIn?.savedOffline == true) "${Formats.time(checkIn.deviceTime)} · saved offline, recorded $recorded" else recorded
                     }
-                    if (checkIn?.pay == LegPayStatus.PENDING_ESCROW) "$base · pay pending" else base
+                    base
                 }
                 LegState.SAVED -> "Saved ${Formats.time(checkIn?.deviceTime ?: 0)} · records when online"
                 LegState.NEXT -> if (failed) "Not recorded · try again" else "Next"

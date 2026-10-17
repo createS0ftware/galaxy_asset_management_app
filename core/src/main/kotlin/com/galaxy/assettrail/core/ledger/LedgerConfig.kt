@@ -2,17 +2,22 @@ package com.galaxy.assettrail.core.ledger
 
 import org.stellar.sdk.Asset
 import org.stellar.sdk.Network
-import java.util.concurrent.TimeUnit
 
+/** Settings for building transactions on a network, used by the simulated platform. */
 data class LedgerConfig(
     val network: Network,
     val usdcIssuer: String,
     /** Inner-transaction base fee in stroops. The fee account pays the real fee through a fee bump. */
     val baseFee: Long = 100,
-    /** [N hours] in the spec (§4.4): an offline check-in older than this needs an ops override. */
-    val offlineMaxAgeMillis: Long = TimeUnit.HOURS.toMillis(6),
 ) {
     val usdc: Asset get() = Asset.createNonNativeAsset("USDC", usdcIssuer)
+
+    /** What the platform reports for this network and [contractId]. */
+    fun networkInfo(contractId: String) = NetworkInfo(
+        networkPassphrase = network.networkPassphrase,
+        contractId = contractId,
+        payAsset = "USDC:$usdcIssuer",
+    )
 
     companion object {
         /** Circle's USDC issuer on the Stellar testnet. */

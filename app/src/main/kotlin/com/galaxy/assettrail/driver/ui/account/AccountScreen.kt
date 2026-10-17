@@ -215,7 +215,8 @@ private fun TechnicalDetails(state: DriverState, network: String, onCopy: (Strin
             Text(profile.accountId, style = Type.MonoSmall, color = Palette.Text)
         }
         KeyValue("Network", network, mono = false)
-        KeyValue("Sequence number", state.sequence.toString())
+        state.network?.let { KeyValue("Contract", Formats.shortHash(it.contractId)) }
+        state.ledger?.let { KeyValue("Latest ledger seen", it.latestLedger.toString()) }
         KeyValue("Waiting to record", state.queue.size.toString())
         KeyValue("Wallet created", Formats.shortHash(profile.walletTx))
     }

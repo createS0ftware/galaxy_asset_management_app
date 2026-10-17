@@ -1,93 +1,65 @@
-# What the driver app expects from the backend
+# How the driver app talks to the backend
 
-The backend and the delivery-escrow contract API are being built by another team. The driver app talks to them through one Kotlin interface, `PlatformApi` ([core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt)). Until their API exists, the `:platform-mock` module answers instead, in-process.
+The backend is [galaxy_asset_management_backend](../../galaxy_asset_management_backend): a Soroban contract (`asset-trail`) plus a Fastify API. The app reaches it through one Kotlin interface, `PlatformApi` ([core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/platform/PlatformApi.kt)). Until an HTTP client exists, the `:platform-mock` module answers in-process and behaves like the backend for the phone. Swap the implementation in [AppContainer.kt](../app/src/main/kotlin/com/galaxy/assettrail/driver/AppContainer.kt).
 
-This page lists what the app currently assumes, so the two sides can be reconciled. Where the backend team's API differs, the app's side changes in one place: a new `PlatformApi` implementation (for example an HTTP client module), swapped in at [AppContainer.kt](../app/src/main/kotlin/com/galaxy/assettrail/driver/AppContainer.kt).
+## The model
 
-## Who does what
+The contract is the escrow (backend PLAN.md D2/D5). The **fee account is the source of every contract transaction**, so the driver's account has no sequence number in play. The phone signs **Soroban authorization entries** for exactly one contract call each:
 
-| On the phone (this app) | On the backend (other team) |
-|---|---|
-| Creates the driver's ed25519 key; only the public address leaves the phone | Creates and sponsors the driver account and USDC trustline (T2) |
-| Builds the salted waypoint payload, canonicalises it (RFC 8785) and hashes it (SHA-256) | Stores the exact payload bytes and salt; never publishes the salt (BR-08) |
-| Builds and signs every driver-sourced transaction: check-ins (T4/T5/delivery), advance claims (T7), cash-outs (T9) | Signer service: checks BR-03, co-signs, wraps in a fee bump paid by the fee account, submits |
-| Keeps one ordered queue of signed transactions, offline included (BR-09) | Indexer: balance, account sequence, activity, contract and advance status |
-| Re-signs the queue when sequence numbers shift; falls back to a record-only check-in when escrow can't pay (§8) | Ops decisions (advances, overrides), escrow contract calls, anchor (SEP-12, SEP-38, SEP-6) |
+| Call | Arguments (ScVal types) | Signed by |
+|---|---|---|
+| `check_in` | `trip: String, wp: u32, payload_hash: Bytes(32)` | driver, then the platform co-signs |
+| `claim_advance` | `trip: String` | driver |
+| `claim_final_pay` | `trip: String, claim_hash: Bytes(32)` | driver only |
+
+[TrailCalls.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/ledger/TrailCalls.kt) builds the invocations and [AuthEntries.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/ledger/AuthEntries.kt) signs them (`ADDRESS_V2` credentials, as the backend's JS SDK). Each entry has a random nonce, so check-ins signed offline never block each other. Its last valid ledger replaces the spec's `maxTime`: latest ledger seen + elapsed time + `maxOfflineHours` (backend `offlineValidUntil`).
+
+The two classic transactions the driver signs are **built by the backend** and checked on the phone before signing ([DriverTransactions.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/ledger/DriverTransactions.kt)):
+
+- T2 wallet set-up: fee account sponsors and creates the account; the driver's account adds the USDC trustline and ends the sponsorship. Anything else is refused.
+- T9 cash-out: one payment of the quoted USDC from the driver to the anchor's `payTo`, with its text `memo`.
 
 ## Calls
 
-All amounts are USDC with 7 decimals. Times are epoch milliseconds.
+All routes are under `/v1`. Amounts are USDC with 7 decimals (decimal strings on the wire).
 
-| Call | Purpose (spec) | Returns |
+| `PlatformApi` | Backend | Notes |
 |---|---|---|
-| `sendPhoneCode(phone)` | Onboarding step 1 | `CodeSent` |
-| `verifyPhone(phone, code)` | Onboarding step 1 | driver id |
-| `submitKyc(driverId, {fullName, idType, idNumber})` | ID check with the anchor, SEP-12 (§5.2 stage 1) | `{approved, provider}` |
-| `createWallet(driverId, {accountId, fullName, phone, momoNumber, recovery})` | T2: sponsored account + trustline; SEP-30 signers when `recovery` | `{accountId, sequence, txHash}` |
-| `snapshot(driverId, activeTripId?)` | Everything the screens show; polled every 4 s while online | `DriverSnapshot` |
-| `acceptOffer` / `declineOffer(driverId, tripId)` | Trips › Offer (§5.2 stage 2) | the `TripPlan` |
-| `submit(driverId, Submission)` | Signer service (§4.3, §4.4) | `Recorded`, `BadSequence`, `Rejected` or `Retry` |
-| `requestOverride(driverId, {tripId, waypointIndex, fix, reason})` | Outside the geofence (§8) | `OverrideInfo` |
-| `reportTagMismatch(driverId, tripId, waypointIndex, scannedTag)` | Tag mismatch alert (§8) | — |
-| `requestAdvance(driverId, tripId, amount)` | Fuel advance request (§5.2 stage 5) | `AdvanceInfo` (status updates arrive in the snapshot) |
-| `claimFinalPay(driverId, tripId)` | Release after the delivery deadline (§1, §4.6) | `ContractInfo` |
-| `quote(driverId, sell)` | SEP-38 firm quote | `FirmQuote` with `expiresAt` |
-| `startCashOut(driverId, quoteId, momoNumber)` | SEP-6 withdrawal | `{cashOutId, anchorAccount, memoHashHex, amount}` |
+| `sendPhoneCode`, `verifyPhone` | `POST /auth/driver/otp`, `POST /auth/driver/verify` | Returns a 30-day driver JWT. Backend only signs in drivers that ops registered |
+| `submitKyc` | none | Sample data |
+| `network` | `GET /network` | Passphrase, contract id, pay asset |
+| `prepareWallet`, `submitWallet` | `POST /driver/wallet/prepare {publicKey}`, `POST /driver/wallet/submit {xdr}` | Sign and submit within 60 s |
+| `snapshot` | `GET /driver/me`, `/driver/wallet`, `/driver/trips`, `/driver/trips/:id` | No single snapshot route yet; the client composes it |
+| `acceptOffer` | `POST /driver/trips/:id/accept` | No decline route (not implemented) |
+| `submitCheckIns` | `POST /driver/trips/:id/checkins/batch {items: [{payload, authEntry}]}` | In order, up to 64, stops at the first failure; re-sends are idempotent |
+| `reportTagMismatch` | none | Sample data; the backend alerts ops when it refuses with `TAG_MISMATCH` |
+| `requestAdvance` | `POST /driver/trips/:id/advances {amount}` | |
+| `claimAdvance` | `POST /driver/trips/:id/advances/claim {authEntry}` | |
+| `claimFinalPay` | `POST /driver/trips/:id/final-pay {payload, authEntry}` | After the delivery deadline, with no signature or dispute |
+| `quote` | `POST /driver/cashouts/quote {amount}` | Returns the cash-out id, `payTo` and `memo` |
+| `prepareCashOut`, `submitCashOut` | `POST /driver/cashouts/:id/prepare`, `POST /driver/cashouts/:id/submit {xdr}` | Fee-bumped by the fee account |
 
-`DriverSnapshot` carries: server time, balance, the driver account's ledger sequence, open offers, the active trip's status (contract state, advances, overrides, legs paid late, closed flag), activity (newest first) and cash-outs.
+## Payloads
 
-## Submissions
+Hashed in RFC 8785 canonical form ([CanonicalJson.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/payload/CanonicalJson.kt)), SHA-256, with a 32-byte base64 `salt`.
 
-`Submission = {kind, envelopeXdr, tripId?, payloadJson?, refId?}`, where `envelopeXdr` is a base64 transaction envelope signed by the driver.
+Waypoint (`check_in`): `v`, `trip`, `wp`, `event` (`pickup` at 0, `arrival` at the last stop, `checkin` in between), `asset`, `tag` (exact match with the asset's registered tag id, e.g. `04:A3:7E:91`), `lat`, `lon`, `acc_m`, `t_device` (UTC to the second), `photos` (`sha256:<64 lowercase hex>`), `salt`.
 
-Every submission:
+Final-pay claim (`claim_final_pay`): `v`, `event: "release"`, `trip`, `asset`, `t_device`, `salt`.
 
-- Source account is the driver's; sequence is the account's next one. Otherwise answer `BadSequence(accountSequence)`; the app re-signs its whole queue from there and retries.
-- Time bounds: `maxTime` is set. Check-ins use capture time + 6 hours (the spec's `[N hours]`); past it, answer `Rejected(TOO_LATE)`.
-- A rejected transaction never reaches the ledger, so it must not use up the sequence number. The app re-signs everything behind it one number lower.
-- `Retry(message)` means "not now, nothing wrong with it" (for example, fee account low). The app keeps it queued and shows the message.
+## Refusal codes
 
-Check-in (`kind = CHECK_IN`, carries `payloadJson`):
+Check-ins (`RejectCode`): `BAD_PAYLOAD`, `TRIP_MISMATCH`, `ASSET_MISMATCH`, `WRONG_WAYPOINT`, `EVENT_MISMATCH`, `TAG_MISMATCH`, `LOW_ACCURACY`, `OUTSIDE_GEOFENCE`, `FUTURE_TIME`, `STALE_CHECKIN`, `OUTSIDE_WINDOW`, `BAD_AUTH_ENTRY`, `TRIP_NOT_MOVING`. Unknown codes map to `UNKNOWN` and show the backend's message.
 
-- `MEMO_HASH` = h = SHA-256 of the RFC 8785 form of the payload.
-- Operation 0: `ManageData("wp", h)`, source = the asset account.
-- Operation 1, checkpoints only: `Payment` trip account → driver, the leg's pay in USDC. Pickup and delivery carry no payment (the final leg is in the contract).
-- Backend checks: driver signature; the hash; payload `trip` and `asset`; BR-03 (next expected waypoint, tag matches, inside the geofence or `payload.override` names an approved override); payment matches the route plan.
-- If the trip account can't pay, answer `Rejected(ESCROW_UNDERFUNDED)`. The app re-signs the same check-in without the payment (same sequence) and marks the leg's pay pending; the backend pays it later and lists it in `latePayments`.
-- On success: co-sign with the platform signer, fee-bump from the fee account, submit, and return `Recorded(txHash, ledgerTime, balance)`.
+Other calls raise `PlatformException(code, message)` with the backend's code, for example `QUOTE_EXPIRED`, `CHECKINS_PENDING`, `NO_MOMO`, `ADVANCE_EXPIRED`, `DEADLINE_NOT_PASSED`, `WALLET_READY`, `TX_MISMATCH`.
 
-Advance claim (`kind = CLAIM_ADVANCE`, `refId` = advance id): one `ClaimClaimableBalance` with the advance's `balanceId`.
+## Where the demo differs from the backend
 
-Cash-out (`kind = CASH_OUT`, `refId` = cash-out id): one `Payment` driver → `anchorAccount`, amount = the quote's sell amount, `MEMO_HASH` = `memoHashHex` from `startCashOut`.
+- Time windows aren't checked and a check-in outside the geofence is accepted, so the demo runs anywhere in minutes. The trip screen warns when the driver is outside the geofence; the backend refuses with `OUTSIDE_WINDOW` / `OUTSIDE_GEOFENCE`.
+- Sign-up, KYC and the MoMo number are sample data. On the backend, ops registers the driver and their MoMo number.
+- Trips can't be declined.
 
-Reject codes the app understands: `MALFORMED`, `BAD_SIGNATURE`, `OUTSIDE_GEOFENCE`, `TAG_MISMATCH`, `NOT_NEXT_WAYPOINT`, `TOO_LATE`, `ESCROW_UNDERFUNDED`, `UNKNOWN_TRIP`, `CLAIM_UNAVAILABLE`, `CASH_OUT_UNKNOWN`, `INSUFFICIENT_BALANCE`. The `message` is shown to the driver as written.
+## Still to do
 
-## Waypoint payload
-
-Hashed in RFC 8785 canonical form; [CanonicalJson.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/payload/CanonicalJson.kt) is the app's implementation and is tested against the RFC's examples.
-
-| Field | Value |
-|---|---|
-| `v` | `1` |
-| `trip`, `asset`, `tag` | trip id, asset id, scanned tag UID (`04:A3:7E:91`) |
-| `wp` | waypoint index, 0 = pickup |
-| `event` | `pickup`, `checkin` or `delivery` |
-| `lat`, `lon`, `acc_m` | GPS to 6 decimals, accuracy in metres |
-| `t_device` | phone time, UTC, to the second (`2026-10-16T11:51:37Z`) |
-| `photos` | `["sha256:<hex>"]`, pickup only today |
-| `salt` | 32 random bytes, base64 |
-| `override` | approved override id, only when ops allowed a check-in outside the geofence |
-
-## Delivery escrow contract
-
-The app never calls the contract itself. It reads `ContractInfo` (`LOCKED`, `DELIVERED`, `DISPUTED`, `RESOLVED`, `RELEASED_AFTER_DEADLINE`, `CANCELLED`, plus locked amount, deadline, payout, advance deduction and tx hash) from the snapshot, and calls `claimFinalPay` after the deadline. The receiver's passkey approval happens on the tracking page, not in this app.
-
-## To agree with the backend team
-
-- Transport and auth. The app sends a driver id today; a session token or SEP-10 auth with the driver key is still to be chosen.
-- Push instead of polling. The app polls `snapshot` every 4 s while online; a push channel would cut that.
-- Which hash `Recorded.txHash` is: the mock returns the fee-bump hash. Either works for the screens; the auditor's lookup needs to know which.
-- Advance cap. BR-06 deducts advances from the final leg, but the sample trip's advance limit (40.00) is bigger than its final leg (25.00). The app caps requests at the smaller of the two; the backend should enforce the same rule.
-- Photo upload. The app hashes load photos and keeps the files; there is no upload call yet.
-- Overrides. The app sends the request with GPS evidence; the anchored override event (BR-07) is the backend's.
-- Network and USDC issuer. The app is set to the Stellar testnet and Circle's testnet USDC issuer ([LedgerConfig.kt](../core/src/main/kotlin/com/galaxy/assettrail/core/ledger/LedgerConfig.kt)).
+- HTTP `PlatformApi` client (session token, error mapping, composing the snapshot).
+- Push instead of polling; photo upload to the payload store.

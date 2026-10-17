@@ -2,14 +2,14 @@ package com.galaxy.assettrail.core.model
 
 import kotlinx.serialization.Serializable
 
-/** States of the delivery escrow contract (spec §3.1, §4.6). */
+/** Where the trip's final leg stands in the contract (spec §3.1, §4.6). */
 @Serializable
 enum class ContractStatus { LOCKED, DELIVERED, DISPUTED, RESOLVED, RELEASED_AFTER_DEADLINE, CANCELLED }
 
 @Serializable
 data class ContractInfo(
     val status: ContractStatus,
-    /** The final leg locked at dispatch. */
+    /** The final leg, held in the contract since dispatch. */
     val locked: Usdc,
     /** If nobody approves or disputes by then, the driver can claim the final leg. */
     val deadline: Long,
@@ -34,9 +34,8 @@ data class AdvanceInfo(
     val status: AdvanceStatus,
     val requestedAt: Long,
     val decidedAt: Long? = null,
-    /** Claimable-balance deadline (T6): after it the trip account reclaims the money. */
+    /** T6 `grant_advance` expiry: after it the advance can't be claimed and stays in escrow. */
     val claimDeadline: Long? = null,
-    val balanceId: String? = null,
     val declineReason: String? = null,
     val claimTx: String? = null,
     val claimedAt: Long? = null,
@@ -45,20 +44,6 @@ data class AdvanceInfo(
     val countsAgainstLimit: Boolean
         get() = status == AdvanceStatus.REQUESTED || status == AdvanceStatus.READY || status == AdvanceStatus.CLAIMED
 }
-
-@Serializable
-enum class OverrideStatus { PENDING, APPROVED, DECLINED, USED }
-
-@Serializable
-data class OverrideInfo(
-    val id: String,
-    val waypointIndex: Int,
-    val status: OverrideStatus,
-    val requestedAt: Long,
-    val distanceM: Int,
-    val decidedBy: String? = null,
-    val decidedAt: Long? = null,
-)
 
 @Serializable
 enum class ActivityKind { LEG_PAY, ADVANCE, FINAL_PAY, CASH_OUT, REFUND }
@@ -80,7 +65,10 @@ data class ActivityItem(
     val note: String? = null,
 )
 
-/** SEP-38 firm quote: the price holds until [expiresAt]. */
+/**
+ * SEP-38 firm quote: the price holds until [expiresAt]. Its [id] is also the cash-out's: the
+ * platform prepares and submits the payment under it.
+ */
 @Serializable
 data class FirmQuote(
     val id: String,
@@ -93,6 +81,9 @@ data class FirmQuote(
     val expiresAt: Long,
     val anchorName: String,
     val eta: String,
+    /** The anchor's account and memo for this withdrawal (SEP-6), so the phone can check what it signs. */
+    val payTo: String? = null,
+    val memo: String? = null,
 )
 
 @Serializable
@@ -114,7 +105,3 @@ data class CashOutInfo(
     val txHash: String? = null,
     val message: String? = null,
 )
-
-/** A leg recorded without its payment (escrow couldn't pay at the time) that ops paid later. */
-@Serializable
-data class LatePayment(val waypointIndex: Int, val amount: Usdc, val txHash: String, val time: Long)

@@ -105,10 +105,10 @@ class CheckInViewModel(private val container: AppContainer, private val waypoint
             if (outcome is CheckInOutcome.Blocked) {
                 val title = when (outcome.reason) {
                     BlockReason.TAG_MISMATCH -> "Tag doesn't match"
-                    BlockReason.OUTSIDE_GEOFENCE -> "Outside the geofence"
                     BlockReason.MOCK_LOCATION -> "Mock location detected"
                     BlockReason.NOT_NEXT -> "Not your next stop"
                     BlockReason.NO_TRIP -> "No active trip"
+                    BlockReason.NOT_SET_UP -> "Not set up for check-ins yet"
                 }
                 block(title, outcome.message, canScanAgain = outcome.reason == BlockReason.TAG_MISMATCH)
             } else {

@@ -51,8 +51,25 @@ class WaypointPayloadTest {
     @Test
     fun `parse reads back what was written`() {
         assertEquals(konongo, WaypointPayload.parse(konongo.canonical()))
-        val withOverride = konongo.copy(override = "OVR-7K2Q")
-        assertEquals(withOverride, WaypointPayload.parse(withOverride.canonical()))
+    }
+
+    @Test
+    fun `events match what the signer service expects at each stop`() {
+        assertEquals(WaypointEvent.PICKUP, WaypointEvent.at(0, last = 4))
+        assertEquals(WaypointEvent.CHECKIN, WaypointEvent.at(2, last = 4))
+        assertEquals("arrival", WaypointEvent.at(4, last = 4).wire)
+    }
+
+    @Test
+    fun `final-pay claim is canonical, salted and reads back`() {
+        val claim = FinalPayClaim("TR-2041", "GX400-0041", Instant.parse("2026-10-18T09:00:00Z"), konongo.salt)
+        assertEquals(
+            """{"asset":"GX400-0041","event":"release","salt":"q7cSVd0Hk9Y7z1VbYw3Xj5rR2sMZcIFv0b0c8yJk9nM=",""" +
+                """"t_device":"2026-10-18T09:00:00Z","trip":"TR-2041","v":1}""",
+            claim.canonical(),
+        )
+        assertEquals(claim, FinalPayClaim.parse(claim.canonical()))
+        assertContentEquals(PayloadVerifier.hash(claim.canonical()), claim.hash())
     }
 
     @Test
@@ -73,7 +90,7 @@ class WaypointPayloadTest {
         val moved = konongo.copy(lat = 6.6168).canonical()
         val result = PayloadVerifier.verify(moved, konongo.hash())
         assertIs<PayloadVerifier.Result.Mismatch>(result)
-        assertEquals(Hashes.hex(konongo.hash()), result.memoHash)
+        assertEquals(Hashes.hex(konongo.hash()), result.recordedHash)
     }
 
     @Test

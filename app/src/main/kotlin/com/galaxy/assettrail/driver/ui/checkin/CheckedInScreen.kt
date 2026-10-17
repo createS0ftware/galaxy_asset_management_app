@@ -79,7 +79,7 @@ fun CheckedInScreen(waypointIndex: Int, onBack: () -> Unit, onOpenWallet: () -> 
             CheckLine(CheckState.DONE, "Asset tag matched", trailing = trip.plan.asset.id, trailingMono = true, divider = false)
             CheckLine(
                 CheckState.DONE,
-                if (checkIn.overrideId != null) "Allowed by ops" else "Inside the geofence",
+                "${checkIn.distanceFromCentreM} m from the centre",
                 trailing = "${Formats.distance(checkIn.distanceFromCentreM)} from centre",
             )
             val photos = WaypointPayload.parse(checkIn.payloadJson).photos
@@ -186,19 +186,10 @@ private fun PayPanel(trip: ActiveTrip, checkIn: CheckIn, type: WaypointType, bal
                 Text("+${checkIn.legPay.display()} USDC", style = Type.MonoLarge, color = Palette.LedgerSoft)
                 Text("Wallet balance $balance USDC", style = Type.Body.copy(fontSize = Type.Small.fontSize.times(1.08f)), color = Palette.TextSecondary)
             }
-            checkIn.pay == LegPayStatus.PENDING_ESCROW -> {
-                Text("Leg ${checkIn.waypointIndex} pay is pending", style = Type.Small, color = Palette.TextSecondary)
-                Amount(checkIn.legPay, Type.MonoLarge, Palette.TextSecondary, suffix = "USDC")
-                Text(
-                    "The trip's escrow couldn't pay this leg, so your location was recorded on its own. Ops has been told and will pay it.",
-                    style = Type.Small,
-                    color = Palette.EmberSoft,
-                )
-            }
             else -> {
                 Text("Leg ${checkIn.waypointIndex} pay arrives when this records", style = Type.Small, color = Palette.TextSecondary)
                 Amount(checkIn.legPay, Type.MonoLarge, Palette.TextSecondary, suffix = "USDC")
-                Text("It's paid in the same transaction as your location record.", style = Type.Small, color = Palette.TextSecondary)
+                Text("The contract pays it in the same call that records your location.", style = Type.Small, color = Palette.TextSecondary)
             }
         }
     }
@@ -216,15 +207,15 @@ private fun LedgerRecordSheet(checkIn: CheckIn, productName: String, isDemo: Boo
         ) {
             Text("Ledger record", style = Type.Subheading, color = Palette.Text)
             RecordField("Transaction", checkIn.txHash.orEmpty(), context)
-            RecordField("Memo (hash of the check-in record)", checkIn.payloadHash, context)
+            RecordField("Recorded hash (of the check-in record)", checkIn.payloadHash, context)
             DividerLine(Palette.Border)
             RecordLine("Phone time", Formats.timeSeconds(checkIn.deviceTime))
             checkIn.ledgerTime?.let { RecordLine("Ledger time", Formats.timeSeconds(it)) }
-            RecordLine("Signed by", "Your wallet, then $productName")
+            RecordLine("Authorized by", "Your wallet, then $productName")
             RecordLine("Network fee", "Paid by $productName")
             if (isDemo) {
                 Text(
-                    "Demo build: the transaction is real and signed on this phone, but the simulated platform doesn't submit it to a Stellar network.",
+                    "Demo build: the authorization is real and signed on this phone, but the simulated platform doesn't submit it to a Stellar network.",
                     style = Type.Small,
                     color = Palette.Demo,
                 )

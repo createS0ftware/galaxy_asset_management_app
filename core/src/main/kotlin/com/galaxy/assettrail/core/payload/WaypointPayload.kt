@@ -15,20 +15,30 @@ import java.time.Instant
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToLong
 
-/** What happened at the waypoint. Pickup starts custody (T4); delivery is the final arrival. */
+/**
+ * What happened at the waypoint. Pickup starts custody (T4); arrival is the check-in at the
+ * delivery stop, which records no pay: the receiver's signature releases the final leg.
+ */
 enum class WaypointEvent(val wire: String) {
     PICKUP("pickup"),
     CHECKIN("checkin"),
-    DELIVERY("delivery");
+    ARRIVAL("arrival");
 
     companion object {
         fun fromWire(value: String) = entries.first { it.wire == value }
+
+        /** The event the signer service expects at a waypoint (backend `eventFor`). */
+        fun at(waypoint: Int, last: Int): WaypointEvent = when (waypoint) {
+            0 -> PICKUP
+            last -> ARRIVAL
+            else -> CHECKIN
+        }
     }
 }
 
 /**
  * The off-chain record behind one check-in (spec §4.2). Only SHA-256 of its canonical JSON goes on
- * the ledger; the payload itself, salt included, stays in the platform's store.
+ * the ledger, in the `check_in` call; the payload itself, salt included, stays in the platform's store.
  */
 data class WaypointPayload(
     val trip: String,
@@ -41,10 +51,8 @@ data class WaypointPayload(
     val accuracyM: Int,
     val deviceTime: Instant,
     val photos: List<String>,
-    /** 32 random bytes, base64. Without it the location could be brute-forced from the public memo. */
+    /** 32 random bytes, base64. Without it the location could be brute-forced from the public hash. */
     val salt: String,
-    /** Reference of an ops override that allowed this check-in outside the geofence, if any. */
-    val override: String? = null,
     val version: Int = 1,
 ) {
     fun toJson(): JsonObject = buildJsonObject {
@@ -60,13 +68,12 @@ data class WaypointPayload(
         put("t_device", DateTimeFormatter.ISO_INSTANT.format(deviceTime))
         put("photos", JsonArray(photos.map(::JsonPrimitive)))
         put("salt", salt)
-        override?.let { put("override", it) }
     }
 
     /** The exact bytes that are hashed. */
     fun canonical(): String = CanonicalJson.encode(toJson())
 
-    /** The 32-byte digest that goes in MEMO_HASH and in the asset account's `wp` entry. */
+    /** The 32-byte digest the driver authorizes in `check_in` and the contract chains into the asset's history. */
     fun hash(): ByteArray = Hashes.sha256(canonical())
 
     companion object {
@@ -94,26 +101,30 @@ data class WaypointPayload(
                 deviceTime = Instant.parse(text("t_device")),
                 photos = obj["photos"]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty(),
                 salt = text("salt"),
-                override = obj["override"]?.jsonPrimitive?.content,
             )
         }
     }
 }
 
 /**
- * The auditor's check (spec §5.4 stage 3): re-hash a payload and compare it with the on-chain memo.
- * Works on any JSON spelling of the payload, because it re-canonicalises before hashing.
+ * The auditor's check (spec §5.4 stage 3): re-hash a payload and compare it with the hash recorded
+ * on-chain. Works on any JSON spelling of the payload, because it re-canonicalises before hashing.
  */
 object PayloadVerifier {
     sealed interface Result {
         data object Match : Result
-        data class Mismatch(val payloadHash: String, val memoHash: String) : Result
+        data class Mismatch(val payloadHash: String, val recordedHash: String) : Result
     }
 
-    fun verify(payloadJson: String, memoHash: ByteArray): Result {
-        val canonical = CanonicalJson.encode(Json.parseToJsonElement(payloadJson))
-        val computed = Hashes.sha256(canonical)
-        return if (computed.contentEquals(memoHash)) Result.Match
-        else Result.Mismatch(Hashes.hex(computed), Hashes.hex(memoHash))
+    /** The RFC 8785 form of any JSON spelling of a payload. */
+    fun canonical(payloadJson: String): String = CanonicalJson.encode(Json.parseToJsonElement(payloadJson))
+
+    /** SHA-256 of the canonical form: the hash the platform records for it. */
+    fun hash(payloadJson: String): ByteArray = Hashes.sha256(canonical(payloadJson))
+
+    fun verify(payloadJson: String, recordedHash: ByteArray): Result {
+        val computed = hash(payloadJson)
+        return if (computed.contentEquals(recordedHash)) Result.Match
+        else Result.Mismatch(Hashes.hex(computed), Hashes.hex(recordedHash))
     }
 }

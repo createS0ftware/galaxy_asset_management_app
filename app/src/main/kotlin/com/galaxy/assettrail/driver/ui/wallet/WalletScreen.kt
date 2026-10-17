@@ -116,14 +116,14 @@ fun WalletScreen(onCashOut: () -> Unit, onRequestAdvance: () -> Unit, onOpenCash
 
         if (!canMoveMoney) {
             Banner(
-                "Cash out and advance claims unlock once your saved check-ins are recorded. They share one queue so nothing is sent out of order.",
+                "Cash out unlocks once your saved check-ins are recorded, so it pays from a settled balance.",
                 tone = BannerTone.PENDING,
             )
         } else if (state.queueNotice != null && state.queue.isNotEmpty()) {
             Banner(state.queueNotice!!, tone = BannerTone.PENDING)
         }
 
-        trip?.advances?.lastOrNull()?.let { AdvanceCard(it, trip.plan.id, canMoveMoney, online, busy, viewModel) }
+        trip?.advances?.lastOrNull()?.let { AdvanceCard(it, trip.plan.id, online, busy, viewModel) }
 
         Activity(state.activity, now, onOpenCashOut)
 
@@ -139,7 +139,6 @@ fun WalletScreen(onCashOut: () -> Unit, onRequestAdvance: () -> Unit, onOpenCash
 private fun AdvanceCard(
     advance: AdvanceInfo,
     tripId: String,
-    canMoveMoney: Boolean,
     online: Boolean,
     busy: Boolean,
     viewModel: WalletViewModel,
@@ -158,7 +157,7 @@ private fun AdvanceCard(
             PrimaryButton(
                 "Claim advance",
                 onClick = { viewModel.claim(advance.id) },
-                enabled = canMoveMoney && online,
+                enabled = online,
                 busy = busy,
                 minHeight = 44.dp,
                 style = Type.ButtonSecondary.copy(fontWeight = FontWeight.Bold),

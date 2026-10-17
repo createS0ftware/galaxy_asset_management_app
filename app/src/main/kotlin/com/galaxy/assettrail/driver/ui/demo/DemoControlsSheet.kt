@@ -67,8 +67,6 @@ class DemoViewModel(private val container: AppContainer) : ActionViewModel() {
 
     fun expireDeadline() = other("Delivery deadline has passed.") { demo?.expireDeliveryDeadline(it) }
 
-    fun payPendingLegs() = other("Ops paid the pending legs.") { demo?.opsPaysPendingLegs(it) }
-
     fun setFlags(change: (DemoFlags) -> DemoFlags) = action {
         demo?.updateFlags(change)
         demo?.flags()?.let { _flags.value = it }
@@ -115,7 +113,7 @@ fun DemoControlsSheet(onDismiss: () -> Unit) {
         ) {
             Text("Demo controls", style = Type.Subheading, color = Palette.Demo)
             Text(
-                "Stand-ins for the backend team's API: they act as the receiver, ops, the payout partner and the platform.",
+                "Stand-ins for the backend: they act as the receiver, ops, the payout partner and the platform.",
                 style = Type.Small,
                 color = Palette.TextSecondary,
             )
@@ -145,14 +143,12 @@ fun DemoControlsSheet(onDismiss: () -> Unit) {
             )
             if (!arrived) Text("Available once the driver checks in at the delivery stop.", style = Type.Caption, color = Palette.TextSecondary)
 
-            Section("Ops and the escrow contract")
+            Section("Ops and the contract")
             SecondaryButton("Resolve dispute for the driver", onClick = viewModel::resolveForDriver, enabled = contract == ContractStatus.DISPUTED)
             SecondaryButton("Skip past the delivery deadline", onClick = viewModel::expireDeadline, enabled = arrived && contract == ContractStatus.LOCKED)
-            SecondaryButton("Pay legs left pending", onClick = viewModel::payPendingLegs, enabled = trip != null)
             SwitchRow("Decline the next advance", flags.declineNextAdvance) { on -> viewModel.setFlags { it.copy(declineNextAdvance = on) } }
 
             Section("Platform")
-            SwitchRow("Escrow can't pay the next leg", flags.underfundNextLeg) { on -> viewModel.setFlags { it.copy(underfundNextLeg = on) } }
             SwitchRow("Fee account low on XLM", flags.feeAccountLow) { on -> viewModel.setFlags { it.copy(feeAccountLow = on) } }
 
             Section("Payout partner")

@@ -27,14 +27,6 @@ class TripViewModel(private val container: AppContainer) : ActionViewModel() {
         }
     }
 
-    fun decline(tripId: String, onDone: () -> Unit) = action(onDone) { repository.declineOffer(tripId) }
-
-    fun requestOverride() = action {
-        val position = fix.value ?: throw IllegalStateException("Waiting for your location.")
-        repository.requestOverride(position, "Driver at the stop; GPS shows outside the geofence")
-        say("Sent to ops with your GPS position.")
-    }
-
     fun claimFinalPay() = action {
         repository.claimFinalPay()
         say("Final pay released to your wallet.")

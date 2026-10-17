@@ -15,30 +15,26 @@ data class Waypoint(
     val geofenceRadiusM: Int,
     val windowStart: Long,
     val windowEnd: Long,
-    /** Zero at pickup. The delivery leg is locked in the escrow contract and paid when the receiver signs. */
+    /** Zero at pickup. The delivery leg stays in the contract and is paid when the receiver signs. */
     val legPay: Usdc,
 )
 
+/** On-chain, an asset is `(contract id, asset id)`: its history is the contract's hash chain for that id. */
 @Serializable
 data class Asset(
     val id: String,
     val name: String,
     val shortName: String,
     val tagId: String,
-    /** The asset's Stellar account (A). Every custody event writes its `wp` data entry. */
-    val account: String,
 )
 
+/** A trip as dispatched: the contract holds every leg plus the advance limit in escrow (BR-02). */
 @Serializable
 data class TripPlan(
     val id: String,
     val asset: Asset,
     val waypoints: List<Waypoint>,
     val advanceLimit: Usdc,
-    /** Trip account (E): holds per-leg pay and the advance limit. */
-    val tripAccount: String,
-    /** Delivery escrow contract (C): holds the final leg until the receiver approves. */
-    val escrowContract: String,
     val receiverName: String,
     /** Set at dispatch: after it, with no approval or dispute, the driver can claim the final leg. */
     val deliveryDeadline: Long,

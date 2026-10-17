@@ -16,12 +16,13 @@ import com.galaxy.assettrail.core.driver.isAwaitingSignature
 import com.galaxy.assettrail.core.driver.nextWaypoint
 import com.galaxy.assettrail.core.geo.Geo
 import com.galaxy.assettrail.core.geo.GpsFix
+import com.galaxy.assettrail.core.ledger.AuthEntries
 import com.galaxy.assettrail.core.ledger.LedgerConfig
 import com.galaxy.assettrail.core.model.AdvanceStatus
 import com.galaxy.assettrail.core.model.CashOutStatus
 import com.galaxy.assettrail.core.model.ContractStatus
-import com.galaxy.assettrail.core.model.OverrideStatus
 import com.galaxy.assettrail.core.model.Usdc
+import com.galaxy.assettrail.core.payload.WaypointEvent
 import com.galaxy.assettrail.core.payload.WaypointPayload
 import com.galaxy.assettrail.core.platform.PlatformException
 import com.galaxy.assettrail.core.platform.RejectCode
@@ -40,6 +41,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -56,13 +58,12 @@ class MutableClock(var instant: Instant) : Clock() {
     }
 }
 
-/** End-to-end: the real repository and transaction signing against the mock backend. */
+/** End-to-end: the real repository, payload hashing and Soroban authorization signing against the mock backend. */
 class DriverFlowTest {
     private val clock = MutableClock(Instant.parse("2026-10-16T07:05:00Z"))
     private val online = MutableStateFlow(true)
-    private val ledger = LedgerConfig.Testnet
     private val platformStore = MemoryStateStore<SimState>()
-    private val platform = MockPlatform(platformStore, ledger, clock, isOnline = { online.value }, latency = {})
+    private val platform = MockPlatform(platformStore, LedgerConfig.Testnet, clock, isOnline = { online.value }, latency = {})
     private val driverStore = MemoryStateStore<DriverState>()
     private val keys = InMemoryDriverKeyStore()
     private val repo = newRepository()
@@ -71,7 +72,6 @@ class DriverFlowTest {
         platform = platform,
         store = driverStore,
         keys = keys,
-        ledger = ledger,
         online = online,
         clock = clock,
         scope = CoroutineScope(Dispatchers.Unconfined),
@@ -98,12 +98,27 @@ class DriverFlowTest {
                 waypointIndex = waypoint.index,
                 scannedTag = tag ?: trip.plan.asset.tagId,
                 fix = GpsFix(position, accuracyM = 8, timeMillis = clock.millis()),
-                photoHashes = listOf("sha256:00ff"),
+                photoHashes = listOf("sha256:" + "00ff".repeat(16)),
             ),
         )
     }
 
+    private suspend fun driveToDelivery() {
+        checkInNext(120.0)
+        repeat(3) { checkInNext() }
+        checkInNext(40.0)
+    }
+
     private fun usdc(amount: String) = Usdc.of(amount)
+
+    @Test
+    fun `wallet set-up is prepared by the platform and signed on the phone`() = runBlocking<Unit> {
+        onboardAndAccept()
+        val profile = assertNotNull(repo.state.value.profile)
+        assertEquals(keys.accountId(), profile.accountId)
+        assertNotNull(repo.state.value.network)
+        assertNotNull(repo.state.value.ledger)
+    }
 
     @Test
     fun `whole trip pays every leg and the final leg on the receiver's signature`() = runBlocking<Unit> {
@@ -120,8 +135,10 @@ class DriverFlowTest {
         }
         assertEquals(usdc("55.00"), trip.earned())
 
-        val delivery = assertIs<CheckInOutcome.Recorded>(checkInNext(40.0)).checkIn
-        assertEquals(LegPayStatus.IN_CONTRACT, delivery.pay)
+        val arrival = assertIs<CheckInOutcome.Recorded>(checkInNext(40.0)).checkIn
+        assertEquals(WaypointEvent.ARRIVAL, arrival.event)
+        assertEquals("arrival", WaypointPayload.parse(arrival.payloadJson).event.wire)
+        assertEquals(LegPayStatus.IN_CONTRACT, arrival.pay)
         assertTrue(trip.isAwaitingSignature())
 
         platform.receiverSigns(trip.plan.id)
@@ -148,7 +165,9 @@ class DriverFlowTest {
         assertIs<CheckInOutcome.Saved>(checkInNext())
         val queue = repo.state.value.queue
         assertEquals(2, queue.size)
-        assertEquals(queue[0].sequence + 1, queue[1].sequence)
+        // Each authorization has its own nonce and covers its own call: no shared sequence number.
+        assertNotEquals(queue[0].authEntry, queue[1].authEntry)
+        assertEquals(keys.accountId(), AuthEntries.inspect(queue[1].authEntry).address)
         assertFalse(repo.state.value.canMoveMoney())
 
         online.value = true
@@ -185,56 +204,27 @@ class DriverFlowTest {
     }
 
     @Test
-    fun `outside the geofence needs an ops override`() = runBlocking<Unit> {
+    fun `outside the geofence the demo still records the check-in`() = runBlocking<Unit> {
         onboardAndAccept()
-        val blocked = assertIs<CheckInOutcome.Blocked>(checkInNext(450.0))
-        assertEquals(BlockReason.OUTSIDE_GEOFENCE, blocked.reason)
-
-        val waypoint = assertNotNull(trip.nextWaypoint())
-        val fix = GpsFix(Geo.offset(waypoint.position, 450.0, 45.0), 12, clock.millis())
-        val requested = repo.requestOverride(fix, "Port gate moved")
-        assertEquals(OverrideStatus.PENDING, requested.status)
-
-        clock.advance(Duration.ofSeconds(10))
-        repo.refresh()
-        assertEquals(OverrideStatus.APPROVED, trip.overrides.single().status)
-
         val recorded = assertIs<CheckInOutcome.Recorded>(checkInNext(450.0)).checkIn
-        assertEquals(requested.id, WaypointPayload.parse(recorded.payloadJson).override)
+        assertTrue(recorded.distanceFromCentreM > trip.plan.pickup.geofenceRadiusM)
     }
 
     @Test
-    fun `underfunded escrow still records the location and leaves pay pending`() = runBlocking<Unit> {
-        onboardAndAccept()
-        checkInNext(120.0)
-        platform.updateFlags { it.copy(underfundNextLeg = true) }
-
-        val nsawam = assertIs<CheckInOutcome.Recorded>(checkInNext()).checkIn
-        assertEquals(LegPayStatus.PENDING_ESCROW, nsawam.pay)
-        assertEquals(Usdc.ZERO, repo.state.value.balance)
-
-        platform.opsPaysPendingLegs(trip.plan.id)
-        repo.refresh()
-        assertEquals(LegPayStatus.PAID, trip.checkIns[1].pay)
-        assertEquals(usdc("18.00"), repo.state.value.balance)
-    }
-
-    @Test
-    fun `a stale check-in fails and the one behind it is re-signed with the freed sequence`() = runBlocking<Unit> {
+    fun `a stale check-in fails and the one behind it is judged on its own`() = runBlocking<Unit> {
         onboardAndAccept()
         checkInNext(120.0)
         online.value = false
         checkInNext()
-        clock.advance(Duration.ofHours(7))
+        clock.advance(Duration.ofHours(13))
         checkInNext()
 
         online.value = true
         repo.flush()
 
         val (nsawam, nkawkaw) = trip.checkIns.drop(1)
-        assertEquals(RejectCode.TOO_LATE, nsawam.failure)
-        // Re-sequenced, so the signer service judged it on BR-03, not on a sequence gap.
-        assertEquals(RejectCode.NOT_NEXT_WAYPOINT, nkawkaw.failure)
+        assertEquals(RejectCode.STALE_CHECKIN, nsawam.failure)
+        assertEquals(RejectCode.WRONG_WAYPOINT, nkawkaw.failure)
         assertTrue(repo.state.value.queue.isEmpty())
         assertEquals(nsawam.waypointIndex, trip.nextWaypoint()?.index)
     }
@@ -250,7 +240,6 @@ class DriverFlowTest {
         repo.refresh()
         val ready = trip.advances.single()
         assertEquals(AdvanceStatus.READY, ready.status)
-        assertNotNull(ready.balanceId)
 
         repo.claimAdvance(ready.id)
         assertEquals(AdvanceStatus.CLAIMED, trip.advances.single().status)
@@ -266,17 +255,21 @@ class DriverFlowTest {
     }
 
     @Test
-    fun `money can't move while check-ins wait in the queue`() = runBlocking<Unit> {
+    fun `cash-out waits while check-ins are queued, advance claims don't`() = runBlocking<Unit> {
         onboardAndAccept()
         checkInNext(120.0)
+        checkInNext()
         repo.requestAdvance(usdc("10.00"))
         clock.advance(Duration.ofSeconds(10))
         repo.refresh()
+        val quote = repo.quote(usdc("5.00"))
         online.value = false
         checkInNext()
         online.value = true // back online, queue not flushed yet
 
-        assertFailsWith<IllegalStateException> { repo.claimAdvance(trip.advances.single().id) }
+        assertFailsWith<IllegalStateException> { repo.cashOut(quote) }
+        repo.claimAdvance(trip.advances.single().id)
+        assertEquals(AdvanceStatus.CLAIMED, trip.advances.single().status)
     }
 
     @Test
@@ -299,6 +292,7 @@ class DriverFlowTest {
 
         val quote = repo.quote(usdc("55.00"))
         assertEquals(usdc("0.55"), quote.fee)
+        assertNotNull(quote.payTo)
         val cashOut = repo.cashOut(quote)
         assertEquals(CashOutStatus.PENDING, cashOut.status)
         assertEquals(Usdc.ZERO, repo.state.value.balance)
@@ -329,16 +323,15 @@ class DriverFlowTest {
         val quote = repo.quote(usdc("10.00"))
         clock.advance(Duration.ofSeconds(61))
         val error = assertFailsWith<PlatformException> { repo.cashOut(quote) }
-        assertEquals("quote_expired", error.code)
+        assertEquals("QUOTE_EXPIRED", error.code)
     }
 
     @Test
     fun `after the deadline the driver claims the final leg without a signature`() = runBlocking<Unit> {
         onboardAndAccept()
-        checkInNext(120.0)
-        repeat(3) { checkInNext() }
-        checkInNext(40.0)
+        driveToDelivery()
         assertFalse(trip.canClaimFinalPay(clock.millis()))
+        assertEquals("DEADLINE_NOT_PASSED", assertFailsWith<PlatformException> { repo.claimFinalPay() }.code)
 
         platform.expireDeliveryDeadline(trip.plan.id)
         repo.refresh()
@@ -351,9 +344,7 @@ class DriverFlowTest {
     @Test
     fun `a dispute holds the final leg until ops resolves it`() = runBlocking<Unit> {
         onboardAndAccept()
-        checkInNext(120.0)
-        repeat(3) { checkInNext() }
-        checkInNext(40.0)
+        driveToDelivery()
         platform.receiverReportsProblem(trip.plan.id)
         platform.expireDeliveryDeadline(trip.plan.id)
         repo.refresh()
@@ -364,6 +355,14 @@ class DriverFlowTest {
         repo.refresh()
         assertEquals(ContractStatus.RESOLVED, trip.contract.status)
         assertEquals(usdc("80.00"), repo.state.value.balance)
+    }
+
+    @Test
+    fun `a dispute after the deadline can't block the driver's claim`() = runBlocking<Unit> {
+        onboardAndAccept()
+        driveToDelivery()
+        platform.expireDeliveryDeadline(trip.plan.id)
+        assertEquals("DEADLINE_PASSED", assertFailsWith<PlatformException> { platform.receiverReportsProblem(trip.plan.id) }.code)
     }
 
     @Test

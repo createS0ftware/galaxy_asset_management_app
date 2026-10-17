@@ -3,9 +3,11 @@ package com.galaxy.assettrail.mock
 import com.galaxy.assettrail.core.driver.AdvanceRules
 import com.galaxy.assettrail.core.geo.Geo
 import com.galaxy.assettrail.core.geo.GeoPoint
+import com.galaxy.assettrail.core.ledger.AuthEntries
 import com.galaxy.assettrail.core.ledger.DriverTransactions
 import com.galaxy.assettrail.core.ledger.LedgerConfig
-import com.galaxy.assettrail.core.ledger.TxReader
+import com.galaxy.assettrail.core.ledger.NetworkInfo
+import com.galaxy.assettrail.core.ledger.TrailCalls
 import com.galaxy.assettrail.core.model.ActivityItem
 import com.galaxy.assettrail.core.model.ActivityKind
 import com.galaxy.assettrail.core.model.ActivityStatus
@@ -16,28 +18,26 @@ import com.galaxy.assettrail.core.model.CashOutStatus
 import com.galaxy.assettrail.core.model.ContractInfo
 import com.galaxy.assettrail.core.model.ContractStatus
 import com.galaxy.assettrail.core.model.FirmQuote
-import com.galaxy.assettrail.core.model.LatePayment
-import com.galaxy.assettrail.core.model.OverrideInfo
-import com.galaxy.assettrail.core.model.OverrideStatus
 import com.galaxy.assettrail.core.model.TripPlan
 import com.galaxy.assettrail.core.model.Usdc
-import com.galaxy.assettrail.core.model.WaypointType
+import com.galaxy.assettrail.core.payload.FinalPayClaim
 import com.galaxy.assettrail.core.payload.Hashes
+import com.galaxy.assettrail.core.payload.PayloadVerifier
+import com.galaxy.assettrail.core.payload.WaypointEvent
 import com.galaxy.assettrail.core.payload.WaypointPayload
-import com.galaxy.assettrail.core.platform.CashOutInstructions
+import com.galaxy.assettrail.core.platform.CheckInResult
 import com.galaxy.assettrail.core.platform.CodeSent
 import com.galaxy.assettrail.core.platform.DriverSnapshot
 import com.galaxy.assettrail.core.platform.KycResult
 import com.galaxy.assettrail.core.platform.KycSubmission
 import com.galaxy.assettrail.core.platform.OfflineException
-import com.galaxy.assettrail.core.platform.OverrideRequest
 import com.galaxy.assettrail.core.platform.PlatformApi
 import com.galaxy.assettrail.core.platform.PlatformException
+import com.galaxy.assettrail.core.platform.PreparedTransaction
 import com.galaxy.assettrail.core.platform.RejectCode
-import com.galaxy.assettrail.core.platform.Submission
-import com.galaxy.assettrail.core.platform.SubmitResult
+import com.galaxy.assettrail.core.platform.SignedCheckIn
+import com.galaxy.assettrail.core.platform.SignedClaim
 import com.galaxy.assettrail.core.platform.TripStatus
-import com.galaxy.assettrail.core.platform.TxKind
 import com.galaxy.assettrail.core.platform.WalletCreated
 import com.galaxy.assettrail.core.platform.WalletRequest
 import com.galaxy.assettrail.core.store.StateStore
@@ -45,19 +45,19 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.stellar.sdk.Account
-import org.stellar.sdk.Claimant
+import org.stellar.sdk.ChangeTrustAsset
 import org.stellar.sdk.FeeBumpTransaction
 import org.stellar.sdk.KeyPair
-import org.stellar.sdk.MemoHash
-import org.stellar.sdk.Predicate
+import org.stellar.sdk.Memo
 import org.stellar.sdk.StrKey
 import org.stellar.sdk.TimeBounds
 import org.stellar.sdk.Transaction
 import org.stellar.sdk.TransactionBuilder
 import org.stellar.sdk.TransactionPreconditions
-import org.stellar.sdk.operations.ClaimClaimableBalanceOperation
-import org.stellar.sdk.operations.CreateClaimableBalanceOperation
-import org.stellar.sdk.operations.ManageDataOperation
+import org.stellar.sdk.operations.BeginSponsoringFutureReservesOperation
+import org.stellar.sdk.operations.ChangeTrustOperation
+import org.stellar.sdk.operations.CreateAccountOperation
+import org.stellar.sdk.operations.EndSponsoringFutureReservesOperation
 import org.stellar.sdk.operations.PaymentOperation
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -74,8 +74,6 @@ interface DemoControls {
 
     suspend fun expireDeliveryDeadline(tripId: String)
 
-    suspend fun opsPaysPendingLegs(tripId: String)
-
     suspend fun flags(): DemoFlags
 
     suspend fun updateFlags(change: (DemoFlags) -> DemoFlags)
@@ -84,12 +82,16 @@ interface DemoControls {
 }
 
 /**
- * In-process stand-in for the backend and escrow-contract API that another team is building:
- * payload store, signer service, fee account, delivery escrow contract, indexer and anchor
- * (SEP-6/SEP-38). It exists so the app runs end to end before their API is available, and it
- * mimics the behaviour the app relies on (see docs/backend-contract.md): it reads the driver's
- * real signed Stellar transactions, enforces BR-03, co-signs, wraps them in a fee bump and applies
- * them to a toy ledger. Nothing is sent to a Stellar network.
+ * In-process stand-in for the backend (galaxy_asset_management_backend): the driver API, the
+ * signer service, the fee account, the Asset Trail contract, the indexer and a SEP-6/SEP-38
+ * anchor. It exists so the app runs end to end offline from any network, and it behaves the way
+ * the backend does for the phone (docs/backend-contract.md): it checks the phone's real Soroban
+ * authorization entries, signature included, applies BR-03, and builds the wallet and cash-out
+ * transactions for the phone to sign. Nothing is sent to a Stellar network.
+ *
+ * Two BR-03 rules are relaxed so the demo can run in minutes from anywhere: time windows aren't
+ * checked, and a check-in outside the geofence is accepted (the app warns first). The backend
+ * refuses both (OUTSIDE_WINDOW, OUTSIDE_GEOFENCE).
  */
 class MockPlatform(
     private val store: StateStore<SimState>,
@@ -106,7 +108,7 @@ class MockPlatform(
 
     // region Plumbing
 
-    private suspend fun load(): SimState = cached ?: (store.read() ?: newState()).also { cached = it }
+    private suspend fun load(): SimState = cached ?: (store.read() ?: newState(clock.millis())).also { cached = it }
 
     private suspend fun <T> online(block: (SimState, Long) -> T): T {
         if (!isOnline()) throw OfflineException()
@@ -126,29 +128,36 @@ class MockPlatform(
         }
     }
 
-    private fun newState() = SimState(
+    private fun newState(now: Long) = SimState(
         seeds = SimSeeds(
             platformSigner = String(KeyPair.random().secretSeed),
             feeAccount = String(KeyPair.random().secretSeed),
             treasury = String(KeyPair.random().secretSeed),
             anchor = String(KeyPair.random().secretSeed),
         ),
+        contractId = StrKey.encodeContract(Hashes.randomBytes(32)),
+        ledgerEpoch = now,
     )
 
+    /** The ledger the toy network has reached: one every [NetworkInfo.ledgerSeconds] since [SimState.ledgerEpoch]. */
+    private fun SimState.latestLedger(now: Long): Long =
+        ledgerSeq + maxOf(0L, (now - ledgerEpoch) / 1000 / NetworkInfo.DEFAULT_LEDGER_SECONDS)
+
     private fun SimState.driver(driverId: String): SimDriver =
-        drivers[driverId] ?: throw PlatformException("driver_unknown", "Sign in again.")
+        drivers[driverId] ?: throw PlatformException("UNAUTHORIZED", "Sign in again.")
 
     private fun SimState.walletOf(driver: SimDriver): SimAccount =
-        driver.accountId?.let { accounts[it] } ?: throw PlatformException("wallet_missing", "Your wallet isn't set up yet.")
+        driver.accountId?.let { accounts[it] } ?: throw PlatformException("DRIVER_WALLET_NOT_READY", "Your wallet isn't set up yet.")
 
     private fun SimState.activeTrip(driverId: String, tripId: String): SimTrip =
         trips[tripId]?.takeIf { it.driverId == driverId && it.state == SimTripState.ACTIVE }
-            ?: throw PlatformException("trip_inactive", "This trip isn't active.")
+            ?: throw PlatformException("TRIP_NOT_MOVING", "This trip isn't active.")
 
-    private fun SimState.platformTx(now: Long, label: String): String {
-        ledgerSeq++
-        val hash = Hashes.hex(Hashes.sha256("$label|$ledgerSeq|$now|${Random.nextLong()}"))
-        ledger += SimLedgerEntry(hash, now, label)
+    /** A transaction the platform submits from the fee account; returns its hash. */
+    private fun SimState.platformTx(time: Long, label: String): String {
+        txCounter++
+        val hash = Hashes.hex(Hashes.sha256("$label|$txCounter|$time|${Random.nextLong()}"))
+        ledger += SimLedgerEntry(hash, time, label)
         return hash
     }
 
@@ -166,6 +175,10 @@ class MockPlatform(
 
     private fun normalisePhone(phone: String) = phone.filter { it.isDigit() || it == '+' }
 
+    private fun parse(xdr: String): Transaction =
+        runCatching { DriverTransactions.parse(xdr, config.network) }.getOrNull()
+            ?: throw PlatformException("BAD_XDR", "The signed transaction couldn't be read.")
+
     // endregion
 
     // region Timers: decisions and settlements the other parties make while the app polls
@@ -174,22 +187,15 @@ class MockPlatform(
         trips.values.forEach { trip ->
             trip.advances.filter { it.info.status == AdvanceStatus.REQUESTED && it.decideAt <= now }
                 .forEach { decideAdvance(trip, it, now) }
-            trip.overrides.filter { it.info.status == OverrideStatus.PENDING && it.decideAt <= now }
-                .forEach { it.info = it.info.copy(status = OverrideStatus.APPROVED, decidedBy = "Ama K. (ops)", decidedAt = now) }
-        }
-        claimables.values.filter { now >= it.deadline }.toList().forEach { claimable ->
-            // The trip account is the second claimant once the deadline passes: the money goes back.
-            claimables.remove(claimable.id)
-            trips[claimable.tripId]?.let { trip ->
-                trip.escrow += claimable.amount
-                trip.advances.find { it.info.id == claimable.advanceId }
-                    ?.let { it.info = it.info.copy(status = AdvanceStatus.EXPIRED) }
-            }
+            // grant_advance's expiry: an unclaimed advance stays in escrow.
+            trip.advances.filter { it.info.status == AdvanceStatus.READY && now >= (it.info.claimDeadline ?: Long.MAX_VALUE) }
+                .forEach { it.info = it.info.copy(status = AdvanceStatus.EXPIRED) }
         }
         cashOuts.values.filter { it.info.status == CashOutStatus.PENDING && (it.completeAt ?: Long.MAX_VALUE) <= now }
             .forEach { settleCashOut(it, now) }
     }
 
+    /** T6: ops approves, and `grant_advance` makes it claimable from escrow until the deadline. */
     private fun SimState.decideAdvance(trip: SimTrip, advance: SimAdvance, now: Long) {
         val amount = advance.info.amount
         val reason = when {
@@ -202,53 +208,9 @@ class MockPlatform(
             advance.info = advance.info.copy(status = AdvanceStatus.DECLINED, decidedAt = now, declineReason = reason)
             return
         }
-        val driverAccount = drivers.getValue(trip.driverId).accountId!!
         val deadline = now + timings.advanceClaimWindowMillis
-        val (balanceId, txHash) = createClaimableBalance(trip, driverAccount, amount, deadline, now)
-        trip.escrow -= amount
-        claimables[balanceId] = SimClaimable(balanceId, trip.plan.id, advance.info.id, amount, driverAccount, deadline)
-        ledger += SimLedgerEntry(txHash, now, "T6 · fuel advance ${amount.display()} USDC for ${trip.plan.id}")
-        advance.info = advance.info.copy(
-            status = AdvanceStatus.READY,
-            decidedAt = now,
-            claimDeadline = deadline,
-            balanceId = balanceId,
-        )
-    }
-
-    /** T6: a claimable balance from the trip account; the driver can claim before the deadline, E after it. */
-    private fun SimState.createClaimableBalance(
-        trip: SimTrip,
-        driverAccount: String,
-        amount: Usdc,
-        deadline: Long,
-        now: Long,
-    ): Pair<String, String> {
-        val fee = KeyPair.fromSecretSeed(seeds.feeAccount)
-        val feeAccount = accounts.getOrPut(fee.accountId) { SimAccount(fee.accountId, ledgerSeq shl 32, Usdc.ZERO) }
-        val deadlineSeconds = deadline / 1000
-        val t6 = TransactionBuilder(Account(fee.accountId, feeAccount.sequence), config.network)
-            .setBaseFee(config.baseFee)
-            .addPreconditions(TransactionPreconditions.builder().timeBounds(TimeBounds(0, now / 1000 + 300)).build())
-            .addOperation(
-                CreateClaimableBalanceOperation.builder()
-                    .asset(config.usdc)
-                    .amount(amount.toBigDecimal())
-                    .claimants(
-                        listOf(
-                            Claimant(driverAccount, Predicate.AbsBefore(deadlineSeconds)),
-                            Claimant(trip.plan.tripAccount, Predicate.Not(Predicate.AbsBefore(deadlineSeconds))),
-                        ),
-                    )
-                    .sourceAccount(trip.plan.tripAccount)
-                    .build(),
-            )
-            .build()
-        feeAccount.sequence++
-        ledgerSeq++
-        t6.sign(fee)
-        t6.sign(KeyPair.fromSecretSeed(seeds.platformSigner))
-        return t6.getClaimableBalanceId(0) to t6.hashHex()
+        platformTx(now, "grant_advance · ${amount.display()} USDC for ${trip.plan.id}")
+        advance.info = advance.info.copy(status = AdvanceStatus.READY, decidedAt = now, claimDeadline = deadline)
     }
 
     private fun SimState.settleCashOut(cashOut: SimCashOut, now: Long) {
@@ -289,22 +251,23 @@ class MockPlatform(
 
     // endregion
 
-    // region Onboarding
+    // region Sign-in and wallet (sample data where the backend has no route yet)
 
     override suspend fun sendPhoneCode(phone: String): CodeSent = online { state, _ ->
         val normalised = normalisePhone(phone)
-        if (normalised.count(Char::isDigit) < 9) throw PlatformException("phone_invalid", "Enter your full phone number.")
+        if (normalised.count(Char::isDigit) < 9) throw PlatformException("BAD_REQUEST", "Enter your full phone number.")
         state.phoneCodes[normalised] = DEMO_CODE
         CodeSent(normalised, demoCode = DEMO_CODE)
     }
 
     override suspend fun verifyPhone(phone: String, code: String): String = online { state, _ ->
         val normalised = normalisePhone(phone)
-        val expected = state.phoneCodes[normalised] ?: throw PlatformException("code_missing", "Ask for a new code.")
+        val expected = state.phoneCodes[normalised] ?: throw PlatformException("UNAUTHORIZED", "Ask for a new code.")
         if (code.trim() != expected) {
-            throw PlatformException("code_wrong", "That code doesn't match. Check the SMS and try again.")
+            throw PlatformException("UNAUTHORIZED", "That code doesn't match. Check the SMS and try again.")
         }
         state.phoneCodes.remove(normalised)
+        // Sample data: the backend only signs in drivers ops registered; the demo registers on first sign-in.
         val driver = state.drivers.values.firstOrNull { it.phone == normalised }
             ?: SimDriver(id = "DRV-${shortId()}", phone = normalised).also { state.drivers[it.id] = it }
         driver.id
@@ -313,31 +276,73 @@ class MockPlatform(
     override suspend fun submitKyc(driverId: String, kyc: KycSubmission): KycResult = online { state, _ ->
         val driver = state.driver(driverId)
         if (kyc.fullName.trim().length < 3 || kyc.idNumber.filter(Char::isLetterOrDigit).length < 6) {
-            throw PlatformException("kyc_incomplete", "Enter your full name and the number on your ID card.")
+            throw PlatformException("BAD_REQUEST", "Enter your full name and the number on your ID card.")
         }
         driver.fullName = kyc.fullName.trim()
         driver.kycApproved = true
         KycResult(approved = true, provider = ANCHOR_NAME)
     }
 
-    override suspend fun createWallet(driverId: String, request: WalletRequest): WalletCreated = online { state, now ->
+    override suspend fun network(): NetworkInfo = online { state, _ -> config.networkInfo(state.contractId) }
+
+    /** T2 as the backend builds it: the fee account sponsors the account and trustline; the phone signs. */
+    override suspend fun prepareWallet(driverId: String, request: WalletRequest): PreparedTransaction = online { state, now ->
         val driver = state.driver(driverId)
-        if (!driver.kycApproved) throw PlatformException("kyc_required", "Finish the ID check first.")
-        if (!StrKey.isValidEd25519PublicKey(request.accountId)) throw PlatformException("account_invalid", "Wallet key is invalid.")
+        if (!driver.kycApproved) throw PlatformException("BAD_REQUEST", "Finish the ID check first.")
+        if (driver.accountId != null) throw PlatformException("WALLET_READY", "Your wallet is already set up.")
+        if (!StrKey.isValidEd25519PublicKey(request.accountId)) throw PlatformException("BAD_PUBLIC_KEY", "Wallet key is invalid.")
+        if (state.drivers.values.any { it.id != driverId && it.accountId == request.accountId }) {
+            throw PlatformException("KEY_IN_USE", "This wallet key belongs to another driver.")
+        }
         if (normalisePhone(request.momoNumber).count(Char::isDigit) < 9) {
-            throw PlatformException("momo_invalid", "Enter the full MTN MoMo number.")
+            throw PlatformException("BAD_REQUEST", "Enter the full MTN MoMo number.")
         }
-        val account = state.accounts.getOrPut(request.accountId) {
-            SimAccount(request.accountId, sequence = state.ledgerSeq shl 32, usdc = Usdc.ZERO)
-        }
-        driver.accountId = account.id
-        driver.momo = normalisePhone(request.momoNumber)
-        driver.recovery = request.recovery
-        val txHash = state.platformTx(now, "T2 · create and sponsor wallet + USDC trustline for ${driver.id}")
+        val fee = KeyPair.fromSecretSeed(state.seeds.feeAccount).accountId
+        val expiresAt = now + timings.walletPrepareMillis
+        val tx = TransactionBuilder(Account(fee, state.feeSequence), config.network)
+            .setBaseFee(config.baseFee)
+            .addPreconditions(TransactionPreconditions.builder().timeBounds(TimeBounds(0, expiresAt / 1000)).build())
+            .addOperation(BeginSponsoringFutureReservesOperation.builder().sponsoredId(request.accountId).sourceAccount(fee).build())
+            .addOperation(CreateAccountOperation.builder().destination(request.accountId).startingBalance(BigDecimal.ZERO).sourceAccount(fee).build())
+            .addOperation(
+                ChangeTrustOperation.builder()
+                    .asset(ChangeTrustAsset(config.usdc))
+                    .limit(MAX_TRUST_LIMIT)
+                    .sourceAccount(request.accountId)
+                    .build(),
+            )
+            .addOperation(EndSponsoringFutureReservesOperation.builder().sourceAccount(request.accountId).build())
+            .build()
+        driver.pendingWallet = SimPendingWallet(
+            accountId = request.accountId,
+            txHash = tx.hashHex(),
+            expiresAt = expiresAt,
+            momo = normalisePhone(request.momoNumber),
+            recovery = request.recovery,
+        )
+        PreparedTransaction(tx.toEnvelopeXdrBase64(), config.network.networkPassphrase, expiresAt)
+    }
+
+    override suspend fun submitWallet(driverId: String, signedXdr: String): WalletCreated = online { state, now ->
+        val driver = state.driver(driverId)
+        val pending = driver.pendingWallet?.takeIf { now <= it.expiresAt }
+            ?: throw PlatformException("NO_PENDING_WALLET", "Prepare the wallet again.")
+        val tx = parse(signedXdr)
+        if (tx.hashHex() != pending.txHash) throw PlatformException("TX_MISMATCH", "Signed transaction differs from the prepared one.")
+        if (!DriverTransactions.isSignedBy(tx, pending.accountId)) throw PlatformException("NOT_SIGNED", "Missing the wallet key signature.")
+        tx.sign(KeyPair.fromSecretSeed(state.seeds.feeAccount))
+        state.feeSequence++
+        state.accounts[pending.accountId] = SimAccount(pending.accountId, sequence = state.latestLedger(now) shl 32, usdc = Usdc.ZERO)
+        driver.accountId = pending.accountId
+        driver.momo = pending.momo
+        driver.recovery = pending.recovery
+        driver.pendingWallet = null
+        val txHash = tx.hashHex()
+        state.ledger += SimLedgerEntry(txHash, now + timings.ledgerCloseMillis, "T2 · sponsored wallet + USDC trustline for ${driver.id}")
         if (state.trips.values.none { it.driverId == driverId && it.state in OPEN_STATES }) {
             state.offerNextTrip(driverId, now)
         }
-        WalletCreated(account.id, account.sequence, txHash)
+        WalletCreated(pending.accountId, txHash)
     }
 
     // endregion
@@ -349,8 +354,8 @@ class MockPlatform(
         val account = driver.accountId?.let { state.accounts[it] }
         DriverSnapshot(
             serverTime = now,
+            latestLedger = state.latestLedger(now),
             balance = account?.usdc ?: Usdc.ZERO,
-            sequence = account?.sequence ?: 0,
             offers = state.trips.values
                 .filter { it.driverId == driverId && it.state == SimTripState.OFFERED }
                 .map { it.plan },
@@ -364,46 +369,27 @@ class MockPlatform(
         tripId = plan.id,
         contract = contract,
         advances = advances.map { it.info },
-        overrides = overrides.map { it.info },
-        latePayments = latePayments.toList(),
         closed = state == SimTripState.CLOSED,
     )
 
     override suspend fun acceptOffer(driverId: String, tripId: String): TripPlan = online { state, now ->
         val trip = state.trips[tripId]?.takeIf { it.driverId == driverId && it.state == SimTripState.OFFERED }
-            ?: throw PlatformException("trip_unavailable", "This trip is no longer available.")
-        if (now > trip.plan.offerExpiresAt) throw PlatformException("offer_expired", "This offer has expired.")
+            ?: throw PlatformException("NOT_OFFERED", "This trip is no longer available.")
+        if (now > trip.plan.offerExpiresAt) throw PlatformException("NOT_OFFERED", "This offer has expired.")
         if (state.trips.values.any { it.driverId == driverId && it.state == SimTripState.ACTIVE }) {
-            throw PlatformException("trip_active", "Finish your current trip first.")
+            throw PlatformException("TRIP_ACTIVE", "Finish your current trip first.")
         }
         trip.state = SimTripState.ACTIVE
         trip.plan
     }
 
-    override suspend fun declineOffer(driverId: String, tripId: String) = online { state, now ->
-        val trip = state.trips[tripId]?.takeIf { it.driverId == driverId && it.state == SimTripState.OFFERED }
-            ?: throw PlatformException("trip_unavailable", "This trip is no longer available.")
-        trip.state = SimTripState.DECLINED
-        state.platformTx(now, "T10 · ${trip.plan.id} declined, escrow back to treasury")
-        if (state.trips.values.none { it.driverId == driverId && it.state in OPEN_STATES }) {
-            state.offerNextTrip(driverId, now)
-        }
-    }
-
+    /** T3: `create_trip` pulls every leg plus the advance limit into the contract (BR-02). */
     private fun SimState.offerNextTrip(driverId: String, now: Long) {
         val number = tripCounter++
         val template = DemoScenario.templateFor(number)
         val tripId = "TR-$number"
-        val fundingTx = platformTx(now, "T3 · fund $tripId")
-        val plan = DemoScenario.plan(
-            template = template,
-            tripId = tripId,
-            now = now,
-            assetAccount = assetAccounts.getOrPut(template.asset.id) { KeyPair.random().accountId },
-            tripAccount = KeyPair.random().accountId,
-            escrowContract = StrKey.encodeContract(Hashes.randomBytes(32)),
-            fundingTx = fundingTx,
-        )
+        val fundingTx = platformTx(now, "create_trip · fund $tripId")
+        val plan = DemoScenario.plan(template = template, tripId = tripId, now = now, fundingTx = fundingTx)
         val finalLeg = plan.delivery.legPay
         val trip = SimTrip(
             plan = plan,
@@ -412,7 +398,6 @@ class MockPlatform(
             escrow = plan.legTotal - finalLeg + plan.advanceLimit,
             contract = ContractInfo(ContractStatus.LOCKED, locked = finalLeg, deadline = plan.deliveryDeadline, updatedAt = now),
         )
-        // BR-02: dispatch only when escrow covers every leg plus the advance limit.
         check(trip.escrow + trip.contract.locked >= plan.escrowRequired)
         trips[tripId] = trip
     }
@@ -421,116 +406,89 @@ class MockPlatform(
 
     // region Signer service
 
-    override suspend fun submit(driverId: String, submission: Submission): SubmitResult = online { state, now ->
-        state.submitLocked(driverId, submission, now)
-    }
+    override suspend fun submitCheckIns(driverId: String, tripId: String, checkIns: List<SignedCheckIn>): List<CheckInResult> =
+        online { state, now ->
+            val results = mutableListOf<CheckInResult>()
+            for (item in checkIns) {
+                val result = state.checkIn(driverId, tripId, item, now)
+                results += result
+                if (result !is CheckInResult.Recorded) break
+            }
+            results
+        }
 
-    private fun SimState.submitLocked(driverId: String, submission: Submission, now: Long): SubmitResult {
+    /** One check-in, the way the backend's signer service handles it (backend/src/services/checkins.ts). */
+    private fun SimState.checkIn(driverId: String, tripId: String, item: SignedCheckIn, now: Long): CheckInResult {
+        fun reject(code: RejectCode, message: String) = CheckInResult.Rejected(code, message)
+
         val driver = driver(driverId)
         val account = walletOf(driver)
-        val tx = runCatching { TxReader.parse(submission.envelopeXdr, config) }.getOrNull()
-            ?: return SubmitResult.Rejected(RejectCode.MALFORMED, "The transaction couldn't be read.")
-        if (tx.sourceAccount != account.id || !TxReader.isSignedBy(tx, account.id)) {
-            return SubmitResult.Rejected(RejectCode.BAD_SIGNATURE, "The transaction isn't signed by your wallet.")
-        }
-        if (tx.sequenceNumber != account.sequence + 1) return SubmitResult.BadSequence(account.sequence)
-        val maxTime = tx.preconditions?.timeBounds?.maxTime?.toLong() ?: 0L
-        if (maxTime != 0L && now / 1000 > maxTime) {
-            return SubmitResult.Rejected(RejectCode.TOO_LATE, "Saved too long ago to record without ops. Ops has been asked to approve it.")
-        }
-        if (demo.feeAccountLow) {
-            return SubmitResult.Retry("$productName is topping up network fees. Saved items will record automatically.")
-        }
-        return when (submission.kind) {
-            TxKind.CHECK_IN -> applyCheckIn(driver, account, tx, submission, now)
-            TxKind.CLAIM_ADVANCE -> applyClaim(driver, account, tx, now)
-            TxKind.CASH_OUT -> applyCashOut(driver, account, tx, submission, now)
-        }
-    }
-
-    private fun SimState.applyCheckIn(
-        driver: SimDriver,
-        account: SimAccount,
-        tx: Transaction,
-        submission: Submission,
-        now: Long,
-    ): SubmitResult {
-        val trip = submission.tripId?.let { trips[it] }?.takeIf { it.driverId == driver.id && it.state == SimTripState.ACTIVE }
-            ?: return SubmitResult.Rejected(RejectCode.UNKNOWN_TRIP, "This trip isn't active.")
+        val trip = trips[tripId]?.takeIf { it.driverId == driverId && it.state == SimTripState.ACTIVE }
+            ?: return reject(RejectCode.TRIP_NOT_MOVING, "This trip isn't active.")
         val plan = trip.plan
-        val payload = submission.payloadJson?.let { runCatching { WaypointPayload.parse(it) }.getOrNull() }
-            ?: return SubmitResult.Rejected(RejectCode.MALFORMED, "The check-in record couldn't be read.")
-        val hash = payload.hash()
-        val memo = (tx.memo as? MemoHash)?.bytes
-        val record = tx.operations.getOrNull(0) as? ManageDataOperation
-        if (memo == null || !memo.contentEquals(hash) || record == null ||
-            record.name != DriverTransactions.WAYPOINT_DATA_KEY || !record.value.contentEquals(hash) ||
-            record.sourceAccount != plan.asset.account || tx.operations.size > 2
-        ) {
-            return SubmitResult.Rejected(RejectCode.MALFORMED, "The location record doesn't match its payload.")
-        }
-        if (payload.trip != plan.id || payload.asset != plan.asset.id) {
-            return SubmitResult.Rejected(RejectCode.MALFORMED, "The check-in is for another trip.")
-        }
+        val hash = runCatching { PayloadVerifier.hash(item.payloadJson) }.getOrNull()
+            ?: return reject(RejectCode.BAD_PAYLOAD, "The check-in record couldn't be read.")
+        recorded[Hashes.hex(hash)]?.let { return CheckInResult.Recorded(it.txHash, it.ledgerTime, account.usdc, duplicate = true) }
+        val payload = runCatching { WaypointPayload.parse(item.payloadJson) }.getOrNull()
+            ?: return reject(RejectCode.BAD_PAYLOAD, "The check-in record couldn't be read.")
 
-        // BR-03: next expected waypoint, matching tag, inside the geofence (or an approved override).
+        // BR-03 (backend/src/services/signer.ts checkWaypoint).
         val expected = plan.waypoints.getOrNull(trip.nextWaypoint)
-            ?: return SubmitResult.Rejected(RejectCode.NOT_NEXT_WAYPOINT, "Every stop on this trip is already recorded.")
-        if (payload.waypoint != expected.index) {
-            return SubmitResult.Rejected(RejectCode.NOT_NEXT_WAYPOINT, "Check in at ${expected.name} first.")
-        }
-        if (payload.tag != plan.asset.tagId) {
-            alerts += "Tag mismatch on ${plan.id} at ${expected.name}: scanned ${payload.tag}"
-            return SubmitResult.Rejected(RejectCode.TAG_MISMATCH, "The scanned tag isn't this trip's ${plan.asset.shortName.lowercase()}. Ops has been alerted.")
+            ?: return reject(RejectCode.WRONG_WAYPOINT, "Every stop on this trip is already recorded.")
+        val last = plan.delivery.index
+        when {
+            payload.version != 1 -> return reject(RejectCode.BAD_PAYLOAD, "Unsupported payload version.")
+            payload.trip != plan.id -> return reject(RejectCode.TRIP_MISMATCH, "Payload is for a different trip.")
+            payload.asset != plan.asset.id -> return reject(RejectCode.ASSET_MISMATCH, "Payload is for a different asset.")
+            payload.waypoint != expected.index -> return reject(RejectCode.WRONG_WAYPOINT, "Check in at ${expected.name} first.")
+            payload.event != WaypointEvent.at(payload.waypoint, last) ->
+                return reject(RejectCode.EVENT_MISMATCH, "Waypoint ${payload.waypoint} expects event \"${WaypointEvent.at(payload.waypoint, last).wire}\".")
+            payload.tag != plan.asset.tagId -> {
+                alerts += "Tag mismatch on ${plan.id} at ${expected.name}: scanned ${payload.tag}"
+                return reject(RejectCode.TAG_MISMATCH, "The scanned tag isn't this trip's ${plan.asset.shortName.lowercase()}. Ops has been alerted.")
+            }
+            payload.photos.any { !PHOTO_HASH.matches(it) } -> return reject(RejectCode.BAD_PAYLOAD, "Photos must be \"sha256:<hex>\" strings.")
+            payload.accuracyM > expected.geofenceRadiusM ->
+                return reject(RejectCode.LOW_ACCURACY, "GPS accuracy ${payload.accuracyM} m is worse than the ${expected.geofenceRadiusM} m geofence.")
         }
         val distance = Geo.distanceRoundedM(GeoPoint(payload.lat, payload.lon), expected.position)
-        val approvedOverride = payload.override?.let { id ->
-            trip.overrides.firstOrNull { it.info.id == id && it.info.waypointIndex == expected.index && it.info.status == OverrideStatus.APPROVED }
+        if (distance > expected.geofenceRadiusM) {
+            // Demo only: the backend refuses this with OUTSIDE_GEOFENCE.
+            alerts += "Outside the geofence on ${plan.id} at ${expected.name}: $distance m from the centre (demo: accepted)"
         }
-        if (distance > expected.geofenceRadiusM && approvedOverride == null) {
-            return SubmitResult.Rejected(
-                RejectCode.OUTSIDE_GEOFENCE,
-                "The location is $distance m from ${expected.name}, outside the ${expected.geofenceRadiusM} m geofence.",
+        val deviceTime = payload.deviceTime.toEpochMilli()
+        if (deviceTime > now + FUTURE_TOLERANCE_MILLIS) return reject(RejectCode.FUTURE_TIME, "Device time is in the future.")
+        if (now - deviceTime > NetworkInfo.DEFAULT_MAX_OFFLINE_HOURS * 3_600_000L) {
+            return reject(
+                RejectCode.STALE_CHECKIN,
+                "Saved more than ${NetworkInfo.DEFAULT_MAX_OFFLINE_HOURS} hours ago, so it can't record without ops. Ops has been asked to look at it.",
             )
         }
 
-        val payment = tx.operations.getOrNull(1) as? PaymentOperation
-        val paysAtCheckIn = expected.type == WaypointType.CHECKPOINT && expected.legPay.isPositive
-        if (tx.operations.size == 2 && payment == null || !paysAtCheckIn && payment != null) {
-            return SubmitResult.Rejected(RejectCode.MALFORMED, "No payment is due at ${expected.name}.")
-        }
-        if (payment != null) {
-            val matches = payment.sourceAccount == plan.tripAccount && payment.destination == account.id &&
-                payment.asset == config.usdc && Usdc.of(payment.amount) == expected.legPay
-            if (!matches) return SubmitResult.Rejected(RejectCode.MALFORMED, "The leg payment doesn't match the route plan.")
-            if (demo.underfundNextLeg || trip.escrow < expected.legPay) {
-                // On-chain the whole transaction would fail, so the location isn't recorded either (§8).
-                demo = demo.copy(underfundNextLeg = false)
-                return SubmitResult.Rejected(RejectCode.ESCROW_UNDERFUNDED, "The trip escrow can't pay this leg right now.")
-            }
+        val invocation = TrailCalls.checkIn(contractId, plan.id, expected.index, hash)
+        AuthEntries.problem(item.authEntry, account.id, invocation, latestLedger(now), config.network)
+            ?.let { return reject(RejectCode.BAD_AUTH_ENTRY, it) }
+        if (demo.feeAccountLow) {
+            return CheckInResult.Retry("$productName is topping up network fees. Saved check-ins will record automatically.")
         }
 
-        val txHash = coSignAndBump(tx, coSign = true)
+        // check_in: one contract call records the hash and pays the leg (BR-04).
         val ledgerTime = now + timings.ledgerCloseMillis
-        account.sequence = tx.sequenceNumber
-        accounts.getOrPut(plan.asset.account) { SimAccount(plan.asset.account, 0, Usdc.ZERO) }
-            .data[DriverTransactions.WAYPOINT_DATA_KEY] = Hashes.hex(hash)
-        payloads[Hashes.hex(hash)] = payload.canonical()
-        ledger += SimLedgerEntry(txHash, ledgerTime, "${payload.event.wire} · ${plan.id} · ${expected.name}")
+        val txHash = platformTx(ledgerTime, "check_in · ${payload.event.wire} · ${plan.id} · ${expected.name}")
+        payloads[Hashes.hex(hash)] = PayloadVerifier.canonical(item.payloadJson)
+        recorded[Hashes.hex(hash)] = SimRecord(txHash, ledgerTime)
         trip.nextWaypoint++
-        approvedOverride?.let { it.info = it.info.copy(status = OverrideStatus.USED) }
-        if (payment != null) {
-            trip.escrow -= expected.legPay
-            account.usdc += expected.legPay
-            addActivity(driver.id, legActivity(plan, expected.index, expected.legPay, ledgerTime, txHash))
-        } else if (paysAtCheckIn) {
-            trip.pendingLegs += expected.index
+        val legPay = if (expected.index == last) Usdc.ZERO else expected.legPay
+        if (legPay.isPositive) {
+            trip.escrow -= legPay
+            account.usdc += legPay
+            addActivity(driver.id, legActivity(plan, expected.index, legPay, ledgerTime, txHash))
         }
-        if (expected.type == WaypointType.DELIVERY) trip.arrivedAt = ledgerTime
-        return SubmitResult.Recorded(txHash, ledgerTime, account.usdc)
+        if (expected.index == last) trip.arrivedAt = ledgerTime
+        return CheckInResult.Recorded(txHash, ledgerTime, account.usdc)
     }
 
-    private fun legActivity(plan: TripPlan, index: Int, amount: Usdc, time: Long, txHash: String, note: String? = null) =
+    private fun legActivity(plan: TripPlan, index: Int, amount: Usdc, time: Long, txHash: String) =
         ActivityItem(
             id = "act-$txHash",
             kind = ActivityKind.LEG_PAY,
@@ -540,123 +498,7 @@ class MockPlatform(
             time = time,
             tripId = plan.id,
             txHash = txHash,
-            note = note,
         )
-
-    private fun SimState.applyClaim(driver: SimDriver, account: SimAccount, tx: Transaction, now: Long): SubmitResult {
-        val operation = tx.operations.singleOrNull() as? ClaimClaimableBalanceOperation
-            ?: return SubmitResult.Rejected(RejectCode.MALFORMED, "That isn't an advance claim.")
-        val claimable = claimables[operation.balanceId]
-            ?: claimables.values.firstOrNull { it.id.equals(operation.balanceId, ignoreCase = true) }
-            ?: return SubmitResult.Rejected(RejectCode.CLAIM_UNAVAILABLE, "This advance can't be claimed any more.")
-        if (claimable.claimant != account.id || now >= claimable.deadline) {
-            return SubmitResult.Rejected(RejectCode.CLAIM_UNAVAILABLE, "The claim deadline for this advance has passed.")
-        }
-        val txHash = coSignAndBump(tx, coSign = false)
-        val ledgerTime = now + timings.ledgerCloseMillis
-        account.sequence = tx.sequenceNumber
-        account.usdc += claimable.amount
-        claimables.remove(claimable.id)
-        ledger += SimLedgerEntry(txHash, ledgerTime, "T7 · claim advance ${claimable.amount.display()} USDC")
-        trips[claimable.tripId]?.advances?.find { it.info.id == claimable.advanceId }?.let {
-            it.info = it.info.copy(status = AdvanceStatus.CLAIMED, claimTx = txHash, claimedAt = ledgerTime)
-        }
-        addActivity(
-            driver.id,
-            ActivityItem(
-                id = "act-$txHash",
-                kind = ActivityKind.ADVANCE,
-                title = "Fuel advance · ${claimable.tripId}",
-                amount = claimable.amount,
-                incoming = true,
-                time = ledgerTime,
-                tripId = claimable.tripId,
-                txHash = txHash,
-                note = "Comes off your final leg pay",
-            ),
-        )
-        return SubmitResult.Recorded(txHash, ledgerTime, account.usdc)
-    }
-
-    private fun SimState.applyCashOut(
-        driver: SimDriver,
-        account: SimAccount,
-        tx: Transaction,
-        submission: Submission,
-        now: Long,
-    ): SubmitResult {
-        val cashOut = submission.refId?.let { cashOuts[it] }?.takeIf { it.driverId == driver.id }
-            ?: return SubmitResult.Rejected(RejectCode.CASH_OUT_UNKNOWN, "The anchor doesn't know this cash out.")
-        if (cashOut.info.status != CashOutStatus.AWAITING_PAYMENT) {
-            return SubmitResult.Rejected(RejectCode.CASH_OUT_UNKNOWN, "This cash out was already paid.")
-        }
-        val payment = tx.operations.singleOrNull() as? PaymentOperation
-        val memo = (tx.memo as? MemoHash)?.hexValue
-        val matches = payment != null && payment.destination == cashOut.anchorAccount && payment.asset == config.usdc &&
-            Usdc.of(payment.amount) == cashOut.info.sell && memo.equals(cashOut.memoHash, ignoreCase = true)
-        if (!matches) return SubmitResult.Rejected(RejectCode.MALFORMED, "The payment doesn't match the anchor's instructions.")
-        if (account.usdc < cashOut.info.sell) {
-            return SubmitResult.Rejected(RejectCode.INSUFFICIENT_BALANCE, "Your balance is lower than the cash-out amount.")
-        }
-        val txHash = coSignAndBump(tx, coSign = false)
-        val ledgerTime = now + timings.ledgerCloseMillis
-        account.sequence = tx.sequenceNumber
-        account.usdc -= cashOut.info.sell
-        ledger += SimLedgerEntry(txHash, ledgerTime, "T9 · cash out ${cashOut.info.sell.display()} USDC to anchor")
-        cashOut.info = cashOut.info.copy(status = CashOutStatus.PENDING, updatedAt = now, txHash = txHash)
-        cashOut.completeAt = now + timings.cashOutSettleMillis
-        cashOut.willFail = demo.failNextCashOut
-        demo = demo.copy(failNextCashOut = false)
-        addActivity(
-            driver.id,
-            ActivityItem(
-                id = activityIdFor(cashOut.info.id),
-                kind = ActivityKind.CASH_OUT,
-                title = "Cash out · MTN MoMo ${maskPhone(cashOut.info.momoNumber)}",
-                amount = cashOut.info.sell,
-                incoming = false,
-                time = ledgerTime,
-                txHash = txHash,
-                status = ActivityStatus.PENDING,
-            ),
-        )
-        return SubmitResult.Recorded(txHash, ledgerTime, account.usdc)
-    }
-
-    /** The platform signer co-signs (it is a signer on A and E); the fee account pays through a fee bump. */
-    private fun SimState.coSignAndBump(tx: Transaction, coSign: Boolean): String {
-        if (coSign) tx.sign(KeyPair.fromSecretSeed(seeds.platformSigner))
-        val fee = KeyPair.fromSecretSeed(seeds.feeAccount)
-        val bump = FeeBumpTransaction.createWithBaseFee(fee.accountId, config.baseFee * 2, tx)
-        bump.sign(fee)
-        ledgerSeq++
-        return bump.hashHex()
-    }
-
-    // endregion
-
-    // region Exceptions, advances, delivery
-
-    override suspend fun requestOverride(driverId: String, request: OverrideRequest): OverrideInfo = online { state, now ->
-        val trip = state.activeTrip(driverId, request.tripId)
-        val waypoint = trip.plan.waypoints.getOrNull(request.waypointIndex)
-            ?: throw PlatformException("waypoint_unknown", "That stop isn't on this trip.")
-        if (waypoint.index != trip.nextWaypoint) throw PlatformException("not_next", "You can only ask about your next stop.")
-        trip.overrides.firstOrNull {
-            it.info.waypointIndex == waypoint.index && it.info.status in setOf(OverrideStatus.PENDING, OverrideStatus.APPROVED)
-        }?.let { return@online it.info }
-        val distance = Geo.distanceRoundedM(request.fix.point, waypoint.position)
-        val info = OverrideInfo(
-            id = "OVR-${shortId()}",
-            waypointIndex = waypoint.index,
-            status = OverrideStatus.PENDING,
-            requestedAt = now,
-            distanceM = distance,
-        )
-        trip.overrides += SimOverride(info, decideAt = now + timings.overrideDecisionMillis)
-        state.alerts += "Override requested on ${trip.plan.id} at ${waypoint.name}: $distance m from centre (${request.reason})"
-        info
-    }
 
     override suspend fun reportTagMismatch(driverId: String, tripId: String, waypointIndex: Int, scannedTag: String) =
         online { state, _ ->
@@ -665,25 +507,70 @@ class MockPlatform(
             Unit
         }
 
+    // endregion
+
+    // region Advances and final pay
+
     override suspend fun requestAdvance(driverId: String, tripId: String, amount: Usdc): AdvanceInfo = online { state, now ->
         val trip = state.activeTrip(driverId, tripId)
-        if (!amount.isPositive) throw PlatformException("amount_invalid", "Enter an amount.")
         val available = AdvanceRules.available(trip.plan, trip.advances.map { it.info })
-        if (amount > available) {
-            throw PlatformException("over_limit", "You can ask for up to ${available.display()} USDC on this trip.")
+        if (!amount.isPositive || amount > available) {
+            throw PlatformException("ADVANCE_OVER_LIMIT", "You can ask for up to ${available.display()} USDC on this trip.")
         }
         val info = AdvanceInfo(id = "ADV-${shortId()}", amount = amount, status = AdvanceStatus.REQUESTED, requestedAt = now)
         trip.advances += SimAdvance(info, decideAt = now + timings.advanceDecisionMillis)
         info
     }
 
-    override suspend fun claimFinalPay(driverId: String, tripId: String): ContractInfo = online { state, now ->
-        val trip = state.activeTrip(driverId, tripId)
-        if (trip.contract.status != ContractStatus.LOCKED || trip.arrivedAt == null) {
-            throw PlatformException("not_claimable", "The final leg can't be claimed now.")
+    /** T7: `claim_advance(trip)` with the driver's authorization; the contract pays from escrow. */
+    override suspend fun claimAdvance(driverId: String, tripId: String, advanceId: String, authEntry: String): AdvanceInfo =
+        online { state, now ->
+            val trip = state.activeTrip(driverId, tripId)
+            val account = state.walletOf(state.driver(driverId))
+            val advance = trip.advances.firstOrNull { it.info.id == advanceId && it.info.status == AdvanceStatus.READY }
+                ?: throw PlatformException("NOT_FOUND", "Granted advance not found.")
+            AuthEntries.problem(authEntry, account.id, TrailCalls.claimAdvance(state.contractId, tripId), state.latestLedger(now), config.network)
+                ?.let { throw PlatformException("BAD_AUTH_ENTRY", it) }
+            val amount = advance.info.amount
+            val ledgerTime = now + timings.ledgerCloseMillis
+            val txHash = state.platformTx(ledgerTime, "claim_advance · ${amount.display()} USDC · $tripId")
+            trip.escrow -= amount
+            account.usdc += amount
+            advance.info = advance.info.copy(status = AdvanceStatus.CLAIMED, claimTx = txHash, claimedAt = ledgerTime)
+            state.addActivity(
+                driverId,
+                ActivityItem(
+                    id = "act-$txHash",
+                    kind = ActivityKind.ADVANCE,
+                    title = "Fuel advance · $tripId",
+                    amount = amount,
+                    incoming = true,
+                    time = ledgerTime,
+                    tripId = tripId,
+                    txHash = txHash,
+                    note = "Comes off your final leg pay",
+                ),
+            )
+            advance.info
         }
-        if (now <= trip.contract.deadline) throw PlatformException("too_early", "The receiver still has time to sign.")
-        state.payFinalLeg(trip, ContractStatus.RELEASED_AFTER_DEADLINE, now, "release_after_deadline")
+
+    /** `claim_final_pay(trip, claim hash)`: after the deadline, the driver's authorization alone releases the final leg. */
+    override suspend fun claimFinalPay(driverId: String, tripId: String, claim: SignedClaim): ContractInfo = online { state, now ->
+        val trip = state.activeTrip(driverId, tripId)
+        val account = state.walletOf(state.driver(driverId))
+        if (trip.contract.status != ContractStatus.LOCKED || trip.arrivedAt == null) {
+            throw PlatformException("TRIP_NOT_AWAITING_SIGNATURE", "The final leg can't be claimed now.")
+        }
+        if (now <= trip.contract.deadline) throw PlatformException("DEADLINE_NOT_PASSED", "The receiver still has time to sign.")
+        val payload = runCatching { FinalPayClaim.parse(claim.payloadJson) }.getOrNull()
+            ?: throw PlatformException("BAD_PAYLOAD", "The claim couldn't be read.")
+        if (payload.trip != tripId) throw PlatformException("TRIP_MISMATCH", "The claim is for a different trip.")
+        if (payload.asset != trip.plan.asset.id) throw PlatformException("ASSET_MISMATCH", "The claim is for a different asset.")
+        val hash = PayloadVerifier.hash(claim.payloadJson)
+        AuthEntries.problem(claim.authEntry, account.id, TrailCalls.claimFinalPay(state.contractId, tripId, hash), state.latestLedger(now), config.network)
+            ?.let { throw PlatformException("BAD_AUTH_ENTRY", it) }
+        state.payloads[Hashes.hex(hash)] = PayloadVerifier.canonical(claim.payloadJson)
+        state.payFinalLeg(trip, ContractStatus.RELEASED_AFTER_DEADLINE, now, "claim_final_pay (driver, after the deadline)")
         trip.contract
     }
 
@@ -694,7 +581,7 @@ class MockPlatform(
         val locked = trip.contract.locked
         val deduction = minOf(AdvanceRules.deduction(trip.advances.map { it.info }), locked)
         val payout = locked - deduction
-        val txHash = platformTx(now, "Escrow contract · $call · ${trip.plan.id}")
+        val txHash = platformTx(now, "$call · ${trip.plan.id}")
         account.usdc += payout
         trip.escrow += deduction
         trip.contract = trip.contract.copy(status = status, payout = payout, deduction = deduction, txHash = txHash, updatedAt = now)
@@ -718,8 +605,7 @@ class MockPlatform(
     }
 
     private fun SimState.closeTrip(trip: SimTrip, now: Long) {
-        payPendingLegs(trip, now)
-        platformTx(now, "T10 · close ${trip.plan.id}, ${trip.escrow.display()} USDC back to treasury")
+        platformTx(now, "close_trip · ${trip.plan.id}, ${trip.escrow.display()} USDC back to the funder")
         trip.escrow = Usdc.ZERO
         trip.state = SimTripState.CLOSED
         if (trips.values.none { it.driverId == trip.driverId && it.state in OPEN_STATES }) {
@@ -727,32 +613,22 @@ class MockPlatform(
         }
     }
 
-    private fun SimState.payPendingLegs(trip: SimTrip, now: Long) {
-        val account = walletOf(drivers.getValue(trip.driverId))
-        trip.pendingLegs.toList().forEach { index ->
-            val amount = trip.plan.waypoints[index].legPay
-            val txHash = platformTx(now, "Ops pays pending leg $index of ${trip.plan.id}")
-            trip.escrow = (trip.escrow - amount).coerceAtLeastZero()
-            account.usdc += amount
-            trip.latePayments += LatePayment(index, amount, txHash, now)
-            addActivity(trip.driverId, legActivity(trip.plan, index, amount, now, txHash, note = "Paid after the check-in"))
-        }
-        trip.pendingLegs.clear()
-    }
-
     // endregion
 
     // region Anchor: SEP-38 quote, SEP-6 withdrawal
 
     override suspend fun quote(driverId: String, sell: Usdc): FirmQuote = online { state, now ->
-        val account = state.walletOf(state.driver(driverId))
-        if (!sell.isPositive) throw PlatformException("amount_invalid", "Enter an amount.")
-        if (sell > account.usdc) throw PlatformException("insufficient", "You have ${account.usdc.display()} USDC.")
+        val driver = state.driver(driverId)
+        val account = state.walletOf(driver)
+        if (driver.momo == null) throw PlatformException("NO_MOMO", "Link a mobile money number first.")
+        if (!sell.isPositive || sell > account.usdc) {
+            throw PlatformException("INSUFFICIENT_BALANCE", "You have ${account.usdc.display()} USDC.")
+        }
         val onePercent = sell.toBigDecimal().multiply(BigDecimal("0.01")).setScale(2, RoundingMode.UP)
         val fee = minOf(Usdc.of(onePercent.max(MIN_FEE)), sell)
         val buy = (sell - fee).toBigDecimal().multiply(BigDecimal(RATE_GHS)).setScale(2, RoundingMode.DOWN)
         val quote = FirmQuote(
-            id = "Q-${shortId()}",
+            id = "CO-${shortId()}",
             sell = sell,
             fee = fee,
             rate = RATE_GHS,
@@ -761,42 +637,93 @@ class MockPlatform(
             expiresAt = now + timings.quoteValidityMillis,
             anchorName = ANCHOR_NAME,
             eta = "Within 5 minutes",
+            payTo = KeyPair.fromSecretSeed(state.seeds.anchor).accountId,
+            memo = "WD-${shortId()}${shortId()}",
         )
         state.quotes[quote.id] = quote
         quote
     }
 
-    override suspend fun startCashOut(driverId: String, quoteId: String, momoNumber: String): CashOutInstructions =
-        online { state, now ->
-            val driver = state.driver(driverId)
-            val account = state.walletOf(driver)
-            val quote = state.quotes[quoteId] ?: throw PlatformException("quote_unknown", "Get a new quote.")
-            if (now > quote.expiresAt) throw PlatformException("quote_expired", "The quote expired. Check the new one.")
-            if (account.usdc < quote.sell) throw PlatformException("insufficient", "You have ${account.usdc.display()} USDC.")
-            val anchorAccount = KeyPair.fromSecretSeed(state.seeds.anchor).accountId
-            val memo = Hashes.hex(Hashes.randomBytes(32))
-            val id = "CO-${shortId()}"
-            state.cashOuts[id] = SimCashOut(
-                info = CashOutInfo(
-                    id = id,
-                    sell = quote.sell,
-                    fee = quote.fee,
-                    buyAmount = quote.buyAmount,
-                    buyCurrency = quote.buyCurrency,
-                    momoNumber = normalisePhone(momoNumber),
-                    status = CashOutStatus.AWAITING_PAYMENT,
-                    createdAt = now,
-                    updatedAt = now,
-                    anchorName = quote.anchorName,
-                    eta = quote.eta,
-                ),
-                driverId = driver.id,
-                anchorAccount = anchorAccount,
-                memoHash = memo,
-            )
-            state.quotes.remove(quoteId)
-            CashOutInstructions(id, anchorAccount, memo, quote.sell, quote)
-        }
+    /** T9 as the backend builds it: one payment from the driver's account to the anchor, with its text memo. */
+    override suspend fun prepareCashOut(driverId: String, quoteId: String): PreparedTransaction = online { state, now ->
+        val driver = state.driver(driverId)
+        val account = state.walletOf(driver)
+        val quote = state.quotes[quoteId] ?: throw PlatformException("NOT_FOUND", "Get a new quote.")
+        if (now > quote.expiresAt) throw PlatformException("QUOTE_EXPIRED", "The quote expired. Check the new one.")
+        if (account.usdc < quote.sell) throw PlatformException("INSUFFICIENT_BALANCE", "You have ${account.usdc.display()} USDC.")
+        val payTo = quote.payTo!!
+        val memo = quote.memo!!
+        val tx = TransactionBuilder(Account(account.id, account.sequence), config.network)
+            .setBaseFee(config.baseFee)
+            .addPreconditions(TransactionPreconditions.builder().timeBounds(TimeBounds(0, now / 1000 + CASH_OUT_TIMEOUT_SECONDS)).build())
+            .addMemo(Memo.text(memo))
+            .addOperation(PaymentOperation.builder().destination(payTo).asset(config.usdc).amount(quote.sell.toBigDecimal()).build())
+            .build()
+        state.cashOuts[quote.id] = SimCashOut(
+            info = CashOutInfo(
+                id = quote.id,
+                sell = quote.sell,
+                fee = quote.fee,
+                buyAmount = quote.buyAmount,
+                buyCurrency = quote.buyCurrency,
+                momoNumber = driver.momo.orEmpty(),
+                status = CashOutStatus.AWAITING_PAYMENT,
+                createdAt = now,
+                updatedAt = now,
+                anchorName = quote.anchorName,
+                eta = quote.eta,
+            ),
+            driverId = driver.id,
+            anchorAccount = payTo,
+            memo = memo,
+            preparedHash = tx.hashHex(),
+        )
+        PreparedTransaction(tx.toEnvelopeXdrBase64(), config.network.networkPassphrase, now + CASH_OUT_TIMEOUT_SECONDS * 1000)
+    }
+
+    override suspend fun submitCashOut(driverId: String, quoteId: String, signedXdr: String): CashOutInfo = online { state, now ->
+        val driver = state.driver(driverId)
+        val account = state.walletOf(driver)
+        val cashOut = state.cashOuts[quoteId]?.takeIf { it.driverId == driver.id }
+            ?: throw PlatformException("NOT_FOUND", "Cash-out not found.")
+        if (cashOut.info.status != CashOutStatus.AWAITING_PAYMENT) throw PlatformException("CASHOUT_NOT_PREPARED", "This cash out was already sent.")
+        val tx = parse(signedXdr)
+        if (tx.hashHex() != cashOut.preparedHash) throw PlatformException("TX_MISMATCH", "Signed transaction differs from the prepared one.")
+        if (!DriverTransactions.isSignedBy(tx, account.id)) throw PlatformException("NOT_SIGNED", "Missing the wallet key signature.")
+        if (account.usdc < cashOut.info.sell) throw PlatformException("INSUFFICIENT_BALANCE", "You have ${account.usdc.display()} USDC.")
+        val txHash = state.feeBump(tx)
+        val ledgerTime = now + timings.ledgerCloseMillis
+        state.ledger += SimLedgerEntry(txHash, ledgerTime, "T9 · cash out ${cashOut.info.sell.display()} USDC to the anchor")
+        account.sequence = tx.sequenceNumber
+        account.usdc -= cashOut.info.sell
+        cashOut.info = cashOut.info.copy(status = CashOutStatus.PENDING, updatedAt = now, txHash = txHash)
+        cashOut.completeAt = now + timings.cashOutSettleMillis
+        cashOut.willFail = state.demo.failNextCashOut
+        state.demo = state.demo.copy(failNextCashOut = false)
+        state.quotes.remove(quoteId)
+        state.addActivity(
+            driver.id,
+            ActivityItem(
+                id = activityIdFor(cashOut.info.id),
+                kind = ActivityKind.CASH_OUT,
+                title = "Cash out · MTN MoMo ${maskPhone(cashOut.info.momoNumber)}",
+                amount = cashOut.info.sell,
+                incoming = false,
+                time = ledgerTime,
+                txHash = txHash,
+                status = ActivityStatus.PENDING,
+            ),
+        )
+        cashOut.info
+    }
+
+    /** The fee account pays for the driver's transaction through a fee bump. */
+    private fun SimState.feeBump(tx: Transaction): String {
+        val fee = KeyPair.fromSecretSeed(seeds.feeAccount)
+        val bump = FeeBumpTransaction.createWithBaseFee(fee.accountId, config.baseFee * 2, tx)
+        bump.sign(fee)
+        return bump.hashHex()
+    }
 
     // endregion
 
@@ -804,31 +731,28 @@ class MockPlatform(
 
     override suspend fun receiverSigns(tripId: String) = locked { state, now ->
         val trip = state.settleableTrip(tripId)
-        if (trip.contract.status != ContractStatus.LOCKED) throw PlatformException("settled", "This delivery is already settled.")
-        state.payFinalLeg(trip, ContractStatus.DELIVERED, now, "confirm_delivery (receiver passkey)")
+        if (trip.contract.status != ContractStatus.LOCKED) throw PlatformException("WRONG_STATUS", "This delivery is already settled.")
+        state.payFinalLeg(trip, ContractStatus.DELIVERED, now, "confirm_delivery (receiver)")
     }
 
+    /** `report_problem` holds the final leg, but only until the deadline: after it the driver's claim can't be blocked. */
     override suspend fun receiverReportsProblem(tripId: String) = locked { state, now ->
         val trip = state.settleableTrip(tripId)
-        if (trip.contract.status != ContractStatus.LOCKED) throw PlatformException("settled", "This delivery is already settled.")
-        val txHash = state.platformTx(now, "Escrow contract · dispute (evidence hash anchored) · ${trip.plan.id}")
+        if (trip.contract.status != ContractStatus.LOCKED) throw PlatformException("WRONG_STATUS", "This delivery is already settled.")
+        if (now > trip.contract.deadline) throw PlatformException("DEADLINE_PASSED", "The deadline to report a problem has passed.")
+        val txHash = state.platformTx(now, "report_problem (evidence hash anchored) · ${trip.plan.id}")
         trip.contract = trip.contract.copy(status = ContractStatus.DISPUTED, txHash = txHash, updatedAt = now)
     }
 
     override suspend fun opsResolvesDisputeForDriver(tripId: String) = locked { state, now ->
         val trip = state.settleableTrip(tripId)
-        if (trip.contract.status != ContractStatus.DISPUTED) throw PlatformException("not_disputed", "There's no open dispute.")
-        state.payFinalLeg(trip, ContractStatus.RESOLVED, now, "resolve (arbiter rules for the driver)")
+        if (trip.contract.status != ContractStatus.DISPUTED) throw PlatformException("WRONG_STATUS", "There's no open dispute.")
+        state.payFinalLeg(trip, ContractStatus.RESOLVED, now, "resolve_dispute (ops rules for the driver)")
     }
 
     override suspend fun expireDeliveryDeadline(tripId: String) = locked { state, now ->
-        val trip = state.trips[tripId] ?: throw PlatformException("trip_unknown", "No such trip.")
+        val trip = state.trips[tripId] ?: throw PlatformException("NOT_FOUND", "No such trip.")
         trip.contract = trip.contract.copy(deadline = now - 1_000, updatedAt = now)
-    }
-
-    override suspend fun opsPaysPendingLegs(tripId: String) = locked { state, now ->
-        val trip = state.trips[tripId] ?: throw PlatformException("trip_unknown", "No such trip.")
-        state.payPendingLegs(trip, now)
     }
 
     override suspend fun flags(): DemoFlags = locked { state, _ -> state.demo }
@@ -844,9 +768,9 @@ class MockPlatform(
 
     private fun SimState.settleableTrip(tripId: String): SimTrip {
         val trip = trips[tripId]?.takeIf { it.state == SimTripState.ACTIVE }
-            ?: throw PlatformException("trip_inactive", "This trip isn't active.")
+            ?: throw PlatformException("TRIP_NOT_MOVING", "This trip isn't active.")
         if (trip.arrivedAt == null) {
-            throw PlatformException("not_arrived", "The driver hasn't checked in at ${trip.plan.delivery.name} yet.")
+            throw PlatformException("WRONG_STATUS", "The driver hasn't checked in at ${trip.plan.delivery.name} yet.")
         }
         return trip
     }
@@ -861,6 +785,10 @@ class MockPlatform(
         const val RATE_GHS = "15.40"
         private val MIN_FEE = BigDecimal("0.25")
         private val OPEN_STATES = setOf(SimTripState.OFFERED, SimTripState.ACTIVE)
+        private val MAX_TRUST_LIMIT = BigDecimal("922337203685.4775807")
+        private val PHOTO_HASH = Regex("^sha256:[0-9a-f]{64}$")
+        private const val FUTURE_TOLERANCE_MILLIS = 5 * 60_000L
+        private const val CASH_OUT_TIMEOUT_SECONDS = 300L
 
         fun maskPhone(phone: String): String = "••" + phone.filter(Char::isDigit).takeLast(4)
     }

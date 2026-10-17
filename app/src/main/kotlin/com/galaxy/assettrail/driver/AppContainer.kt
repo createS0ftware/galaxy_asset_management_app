@@ -47,8 +47,8 @@ class AppContainer(app: Application) {
 
     val keyVault = AndroidKeyVault(app)
 
-    // The backend and escrow-contract API are another team's. Until theirs is wired in, this
-    // in-process stand-in answers for it; replace it with their client here.
+    // Until an HTTP client for galaxy_asset_management_backend is wired in, this in-process
+    // stand-in answers for it (docs/backend-contract.md); replace it with that client here.
     private val mockPlatform = MockPlatform(
         store = FileStateStore(File(app.filesDir, "mock-platform.json"), SimState.serializer()),
         config = ledger,
@@ -63,7 +63,6 @@ class AppContainer(app: Application) {
         platform = platform,
         store = FileStateStore(File(app.filesDir, "driver-state.json"), DriverState.serializer()),
         keys = keyVault,
-        ledger = ledger,
         online = online,
         clock = clock,
         scope = scope,

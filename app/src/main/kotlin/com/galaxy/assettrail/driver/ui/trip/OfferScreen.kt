@@ -26,7 +26,6 @@ import com.galaxy.assettrail.driver.ui.Panel
 import com.galaxy.assettrail.driver.ui.PrimaryButton
 import com.galaxy.assettrail.driver.ui.ScreenColumn
 import com.galaxy.assettrail.driver.ui.ScreenTitle
-import com.galaxy.assettrail.driver.ui.SecondaryButton
 import com.galaxy.assettrail.driver.ui.SectionHeading
 import com.galaxy.assettrail.driver.ui.StopMark
 import com.galaxy.assettrail.driver.ui.StopRow
@@ -95,6 +94,5 @@ fun OfferScreen(tripId: String, onBack: () -> Unit) {
         }
 
         PrimaryButton("Accept trip", onClick = { viewModel.accept(plan.id, onBack) }, busy = busy)
-        SecondaryButton("Decline", onClick = { viewModel.decline(plan.id, onBack) }, enabled = !busy, minHeight = 52.dp)
     }
 }
